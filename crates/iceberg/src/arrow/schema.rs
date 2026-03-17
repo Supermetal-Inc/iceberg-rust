@@ -29,6 +29,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::statistics::Statistics;
+use parquet::variant::VariantType as ParquetVariantType;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -529,9 +530,16 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         } else {
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())])
         };
-        Ok(ArrowSchemaOrFieldOrType::Field(
-            Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata),
-        ))
+        let arrow_field =
+            Field::new(field.name.clone(), ty, !field.required).with_metadata(metadata);
+        // Add Variant extension type for parquet-rs to write VARIANT logical type
+        let arrow_field = if matches!(field.field_type.as_ref(), Type::Variant(_)) {
+            arrow_field.with_extension_type(ParquetVariantType)
+        } else {
+            arrow_field
+        };
+        println!("arrow_field: {:?}", arrow_field);
+        Ok(ArrowSchemaOrFieldOrType::Field(arrow_field))
     }
 
     fn r#struct(
