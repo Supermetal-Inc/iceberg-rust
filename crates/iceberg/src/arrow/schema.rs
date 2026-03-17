@@ -538,7 +538,6 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         } else {
             arrow_field
         };
-        println!("arrow_field: {:?}", arrow_field);
         Ok(ArrowSchemaOrFieldOrType::Field(arrow_field))
     }
 
