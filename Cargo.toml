@@ -76,10 +76,6 @@ fastnum = { version = "0.7", default-features = false, features = [
   "std",
   "serde",
 ] }
-fastnum = { version = "0.7", default-features = false, features = [
-  "std",
-  "serde",
-] }
 faststr = "0.2.31"
 flate2 = "1.1.5"
 fnv = "1.0.7"
