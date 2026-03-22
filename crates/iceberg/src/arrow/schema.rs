@@ -43,7 +43,7 @@ use crate::{Error, ErrorKind};
 /// When iceberg map type convert to Arrow map type, the default map field name is "key_value".
 pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
 /// UTC time zone for Arrow timestamp type.
-pub const UTC_TIME_ZONE: &str = "+00:00";
+pub const UTC_TIME_ZONE: &str = "UTC";
 
 /// A post order arrow schema visitor.
 ///
