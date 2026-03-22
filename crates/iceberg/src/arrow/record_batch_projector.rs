@@ -157,7 +157,7 @@ impl RecordBatchProjector {
     }
 
     /// Return the reference of projected schema
-    pub(crate) fn projected_schema_ref(&self) -> &SchemaRef {
+    pub fn projected_schema_ref(&self) -> &SchemaRef {
         &self.projected_schema
     }
 
