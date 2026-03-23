@@ -37,6 +37,7 @@ pub struct FastAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
 }
 
 impl FastAppendAction {
@@ -47,6 +48,7 @@ impl FastAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            added_delete_files: vec![],
         }
     }
 
@@ -56,9 +58,19 @@ impl FastAppendAction {
         self
     }
 
-    /// Add data files to the snapshot.
+    /// Add data files to the snapshot. Files are categorized by content type:
+    /// - Data files go to added_data_files
+    /// - Delete files (position/equality) go to added_delete_files
     pub fn add_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
-        self.added_data_files.extend(data_files);
+        for file in data_files {
+            match file.content_type() {
+                crate::spec::DataContentType::Data => self.added_data_files.push(file),
+                crate::spec::DataContentType::PositionDeletes
+                | crate::spec::DataContentType::EqualityDeletes => {
+                    self.added_delete_files.push(file)
+                }
+            }
+        }
         self
     }
 
@@ -90,10 +102,11 @@ impl TransactionAction for FastAppendAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            self.added_delete_files.clone(),
         );
 
-        // validate added files
-        snapshot_producer.validate_added_data_files()?;
+        snapshot_producer.validate_added_data_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_data_files(&self.added_delete_files)?;
 
         // Checks duplicate files
         if self.check_duplicate {

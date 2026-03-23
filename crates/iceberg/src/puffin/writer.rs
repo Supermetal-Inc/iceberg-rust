@@ -26,6 +26,14 @@ use crate::io::{FileWrite, OutputFile};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata, Flag};
 
+/// Result of writing a puffin file.
+pub struct PuffinWriteResult {
+    /// Total size of the written puffin file.
+    pub file_size_in_bytes: u64,
+    /// Metadata for blobs written into the puffin file.
+    pub blobs_metadata: Vec<BlobMetadata>,
+}
+
 /// Puffin writer
 pub struct PuffinWriter {
     writer: Box<dyn FileWrite>,
@@ -88,11 +96,19 @@ impl PuffinWriter {
     }
 
     /// Finalizes the Puffin file
-    pub async fn close(mut self) -> Result<()> {
+    pub async fn close(self) -> Result<()> {
+        self.close_with_metadata().await.map(|_| ())
+    }
+
+    /// Finalizes the Puffin file and returns metadata for blobs written.
+    pub async fn close_with_metadata(mut self) -> Result<PuffinWriteResult> {
         self.write_header_once().await?;
         self.write_footer().await?;
         self.writer.close().await?;
-        Ok(())
+        Ok(PuffinWriteResult {
+            file_size_in_bytes: self.num_bytes_written,
+            blobs_metadata: self.written_blobs_metadata,
+        })
     }
 
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
@@ -151,7 +167,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::compression::CompressionCodec;
-    use crate::io::{FileIO, InputFile, OutputFile};
+    use crate::io::{FileIOBuilder, InputFile, OutputFile};
     use crate::puffin::blob::Blob;
     use crate::puffin::metadata::FileMetadata;
     use crate::puffin::reader::PuffinReader;
@@ -169,7 +185,7 @@ mod tests {
         blobs: Vec<(Blob, CompressionCodec)>,
         properties: HashMap<String, String>,
     ) -> Result<OutputFile> {
-        let file_io = FileIO::new_with_fs();
+        let file_io = FileIOBuilder::new_fs_io().build()?;
 
         let path_buf = temp_dir.path().join("temp_puffin.bin");
         let temp_path = path_buf.to_str().unwrap();
