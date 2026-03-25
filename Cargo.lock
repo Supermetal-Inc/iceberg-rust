@@ -4704,9 +4704,9 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant"
-version = "58.0.0"
+version = "58.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00ba4e5dcbc8ad65882b7337a95c12a0f9cbb6add237c53d93b803b7d7f70f02"
+checksum = "2bf493f3c9ddd984d0efb019f67343e4aa4bab893931f6a14b82083065dc3d28"
 dependencies = [
  "arrow-schema",
  "chrono",
@@ -4718,9 +4718,9 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant-compute"
-version = "58.0.0"
+version = "58.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ec4cfb8da15565c8d211b6bc51e8eb481ea65d19132462af3f948b150ac8efe"
+checksum = "6ac038d46a503a7d563b4f5df5802c4315d5343d009feab195d15ac512b4cb27"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -4735,9 +4735,9 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant-json"
-version = "58.0.0"
+version = "58.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3668ff00a6aeb29d172ba15f9d8fedf1675d79bff7d1916daa333efdeaa13e46"
+checksum = "015a09c2ffe5108766c7c1235c307b8a3c2ea64eca38455ba1a7f3a7f32f16e2"
 dependencies = [
  "arrow-schema",
  "base64",
