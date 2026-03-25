@@ -32,7 +32,9 @@ use pyo3::types::{PyAny, PyCapsule};
 
 use crate::runtime::runtime;
 
-pub(crate) fn validate_pycapsule(capsule: &Bound<PyCapsule>, name: &str) -> PyResult<()> {
+// pyo3 0.28's CapsuleName only exposes `unsafe fn as_cstr() -> &CStr`,
+// so we accept &CStr to allow direct comparison without UTF-8 validation.
+pub(crate) fn validate_pycapsule(capsule: &Bound<PyCapsule>, name: &CStr) -> PyResult<()> {
     let capsule_name = capsule.name()?;
     match capsule_name {
         None => Err(PyValueError::new_err(
