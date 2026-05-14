@@ -476,20 +476,38 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
+        let operation = snapshot_produce_operation.operation();
+        if operation != Operation::Overwrite {
+            for data_file in &self.deleted_data_files {
+                summary_collector.remove_file(
+                    data_file,
+                    table_metadata.current_schema().clone(),
+                    table_metadata.default_partition_spec().clone(),
+                );
+            }
+            for delete_file in &self.deleted_delete_files {
+                summary_collector.remove_file(
+                    delete_file,
+                    table_metadata.current_schema().clone(),
+                    table_metadata.default_partition_spec().clone(),
+                );
+            }
+        }
+
         let previous_snapshot = table_metadata.current_snapshot();
 
         let mut additional_properties = summary_collector.build();
         additional_properties.extend(self.snapshot_properties.clone());
 
         let summary = Summary {
-            operation: snapshot_produce_operation.operation(),
+            operation: operation.clone(),
             additional_properties,
         };
 
         update_snapshot_summaries(
             summary,
             previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
+            operation == Operation::Overwrite,
         )
     }
 
