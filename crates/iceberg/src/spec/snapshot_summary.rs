@@ -331,11 +331,9 @@ where T: PartialOrd + Default + ToString {
 
 #[allow(dead_code)]
 pub(crate) fn update_snapshot_summaries(
-    summary: Summary,
+    mut summary: Summary,
     previous_summary: Option<&Summary>,
-    truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
@@ -346,18 +344,6 @@ pub(crate) fn update_snapshot_summaries(
             "Operation is not supported.",
         ));
     }
-
-    let mut summary = match previous_summary {
-        Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
-            truncate_table_summary(summary, prev_summary)
-                .map_err(|err| {
-                    Error::new(ErrorKind::Unexpected, "Failed to truncate table summary.")
-                        .with_source(err)
-                })
-                .unwrap()
-        }
-        _ => summary,
-    };
 
     update_totals(
         &mut summary,
@@ -410,79 +396,6 @@ pub(crate) fn update_snapshot_summaries(
 }
 
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
-    let value_str = previous_summary
-        .additional_properties
-        .get(prop)
-        .map(String::as_str)
-        .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Failed to parse value from previous summary property.",
-        )
-        .with_source(err)
-    })
-}
-
-#[allow(dead_code)]
-fn truncate_table_summary(mut summary: Summary, previous_summary: &Summary) -> Result<Summary> {
-    for prop in [
-        TOTAL_DATA_FILES,
-        TOTAL_DELETE_FILES,
-        TOTAL_RECORDS,
-        TOTAL_FILE_SIZE,
-        TOTAL_POSITION_DELETES,
-        TOTAL_EQUALITY_DELETES,
-    ] {
-        summary
-            .additional_properties
-            .insert(prop.to_string(), "0".to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_DATA_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_DATA_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_DELETE_FILES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_DELETE_FILES.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_RECORDS)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(DELETED_RECORDS.to_string(), value.to_string());
-    }
-    let value = get_prop(previous_summary, TOTAL_FILE_SIZE)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_FILE_SIZE.to_string(), value.to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_POSITION_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_POSITION_DELETES.to_string(), value.to_string());
-    }
-
-    let value = get_prop(previous_summary, TOTAL_EQUALITY_DELETES)?;
-    if value != 0 {
-        summary
-            .additional_properties
-            .insert(REMOVED_EQUALITY_DELETES.to_string(), value.to_string());
-    }
-
-    Ok(summary)
-}
-
-#[allow(dead_code)]
 fn update_totals(
     summary: &mut Summary,
     previous_summary: Option<&Summary>,
@@ -510,7 +423,7 @@ fn update_totals(
         .get(removed_property)
         .map(|value| value.parse::<u64>().unwrap())
     {
-        new_total -= value;
+        new_total = new_total.saturating_sub(value);
     }
     summary
         .additional_properties
@@ -568,7 +481,7 @@ mod tests {
             additional_properties: new_props,
         };
 
-        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary)).unwrap();
 
         assert_eq!(
             updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
@@ -602,117 +515,6 @@ mod tests {
                 .get(TOTAL_EQUALITY_DELETES)
                 .unwrap(),
             "4"
-        );
-    }
-
-    #[test]
-    fn test_truncate_table_summary() {
-        let prev_props: HashMap<String, String> = [
-            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
-            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
-            (TOTAL_RECORDS.to_string(), "100".to_string()),
-            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
-            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
-            (TOTAL_EQUALITY_DELETES.to_string(), "2".to_string()),
-        ]
-        .into_iter()
-        .collect();
-
-        let previous_summary = Summary {
-            operation: Operation::Overwrite,
-            additional_properties: prev_props,
-        };
-
-        let mut new_props = HashMap::new();
-        new_props.insert("dummy".to_string(), "value".to_string());
-        let summary = Summary {
-            operation: Operation::Overwrite,
-            additional_properties: new_props,
-        };
-
-        let truncated = truncate_table_summary(summary, &previous_summary).unwrap();
-
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_DATA_FILES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_DELETE_FILES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated.additional_properties.get(TOTAL_RECORDS).unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_FILE_SIZE)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_POSITION_DELETES)
-                .unwrap(),
-            "0"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(TOTAL_EQUALITY_DELETES)
-                .unwrap(),
-            "0"
-        );
-
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(DELETED_DATA_FILES)
-                .unwrap(),
-            "10"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_DELETE_FILES)
-                .unwrap(),
-            "5"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(DELETED_RECORDS)
-                .unwrap(),
-            "100"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_FILE_SIZE)
-                .unwrap(),
-            "1000"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_POSITION_DELETES)
-                .unwrap(),
-            "3"
-        );
-        assert_eq!(
-            truncated
-                .additional_properties
-                .get(REMOVED_EQUALITY_DELETES)
-                .unwrap(),
-            "2"
         );
     }
 

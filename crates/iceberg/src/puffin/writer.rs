@@ -167,7 +167,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::compression::CompressionCodec;
-    use crate::io::{FileIOBuilder, InputFile, OutputFile};
+    use crate::io::{FileIO, InputFile, OutputFile};
     use crate::puffin::blob::Blob;
     use crate::puffin::metadata::FileMetadata;
     use crate::puffin::reader::PuffinReader;
@@ -185,7 +185,7 @@ mod tests {
         blobs: Vec<(Blob, CompressionCodec)>,
         properties: HashMap<String, String>,
     ) -> Result<OutputFile> {
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
 
         let path_buf = temp_dir.path().join("temp_puffin.bin");
         let temp_path = path_buf.to_str().unwrap();

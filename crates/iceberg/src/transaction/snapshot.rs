@@ -477,21 +477,19 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let operation = snapshot_produce_operation.operation();
-        if operation != Operation::Overwrite {
-            for data_file in &self.deleted_data_files {
-                summary_collector.remove_file(
-                    data_file,
-                    table_metadata.current_schema().clone(),
-                    table_metadata.default_partition_spec().clone(),
-                );
-            }
-            for delete_file in &self.deleted_delete_files {
-                summary_collector.remove_file(
-                    delete_file,
-                    table_metadata.current_schema().clone(),
-                    table_metadata.default_partition_spec().clone(),
-                );
-            }
+        for data_file in &self.deleted_data_files {
+            summary_collector.remove_file(
+                data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
+        }
+        for delete_file in &self.deleted_delete_files {
+            summary_collector.remove_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
         }
 
         let previous_snapshot = table_metadata.current_snapshot();
@@ -504,11 +502,7 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            operation == Operation::Overwrite,
-        )
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()))
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
