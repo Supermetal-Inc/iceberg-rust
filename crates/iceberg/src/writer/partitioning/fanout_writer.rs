@@ -24,7 +24,9 @@ use async_trait::async_trait;
 
 use crate::spec::{PartitionKey, Struct};
 use crate::writer::partitioning::PartitioningWriter;
-use crate::writer::{DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder};
+use crate::writer::{
+    CurrentFileStatus, DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder,
+};
 use crate::{Error, ErrorKind, Result};
 
 /// A writer that can write data to multiple partitions simultaneously.
@@ -66,6 +68,17 @@ where
             output: Vec::new(),
             _phantom: PhantomData,
         }
+    }
+
+    /// Sum of `current_written_size` across every live partition writer.
+    pub fn total_written_size(&self) -> usize
+    where
+        B::R: CurrentFileStatus,
+    {
+        self.partition_writers
+            .values()
+            .map(|w| w.current_written_size())
+            .sum()
     }
 
     /// Get or create a writer for the specified partition.

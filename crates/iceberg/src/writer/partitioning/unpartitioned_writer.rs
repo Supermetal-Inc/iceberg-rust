@@ -20,7 +20,9 @@
 use std::marker::PhantomData;
 
 use crate::Result;
-use crate::writer::{DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder};
+use crate::writer::{
+    CurrentFileStatus, DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder,
+};
 
 /// A simple wrapper around `IcebergWriterBuilder` for unpartitioned tables.
 ///
@@ -99,6 +101,26 @@ where
             self.output.extend(writer.close().await?);
         }
         Ok(O::from_iter(self.output))
+    }
+}
+
+impl<B, I, O> CurrentFileStatus for UnpartitionedWriter<B, I, O>
+where
+    B: IcebergWriterBuilder<I, O>,
+    B::R: CurrentFileStatus,
+    O: IntoIterator + FromIterator<<O as IntoIterator>::Item>,
+    <O as IntoIterator>::Item: Clone,
+{
+    fn current_file_path(&self) -> String {
+        self.writer.as_ref().unwrap().current_file_path()
+    }
+
+    fn current_row_num(&self) -> usize {
+        self.writer.as_ref().unwrap().current_row_num()
+    }
+
+    fn current_written_size(&self) -> usize {
+        self.writer.as_ref().unwrap().current_written_size()
     }
 }
 
