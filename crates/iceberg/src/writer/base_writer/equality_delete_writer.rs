@@ -20,9 +20,11 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_schema::extension::{EXTENSION_TYPE_NAME_KEY, ExtensionType};
 use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
 use itertools::Itertools;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::variant::VariantType as ParquetVariantType;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
 use crate::arrow::schema_to_arrow_schema;
@@ -100,7 +102,11 @@ impl EqualityDeleteWriterConfig {
                         .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?,
                 ))
             },
-            |_field: &Field| true,
+            // Variant's inner binary fields carry no field id.
+            |field: &Field| {
+                field.metadata().get(EXTENSION_TYPE_NAME_KEY).map(String::as_str)
+                    != Some(ParquetVariantType::NAME)
+            },
         )?;
         Ok(Self {
             equality_ids,
@@ -216,7 +222,7 @@ mod test {
     use crate::io::FileIO;
     use crate::spec::{
         DataFile, DataFileFormat, ListType, MapType, NestedField, PrimitiveType, Schema,
-        StructType, Type,
+        StructType, Type, VariantType,
     };
     use crate::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -697,6 +703,23 @@ mod test {
         )
         .await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_with_variant_column() -> Result<(), anyhow::Error> {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "payload", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let config = EqualityDeleteWriterConfig::new(vec![1], schema)?;
+        assert_eq!(config.projected_arrow_schema_ref().fields().len(), 1);
         Ok(())
     }
 

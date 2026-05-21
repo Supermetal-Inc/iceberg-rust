@@ -98,6 +98,7 @@ pub mod test_utils;
 mod utils;
 pub mod writer;
 
+/// Deletion vector representation for V3 positional deletes.
 pub mod delete_vector;
 pub mod metadata_columns;
 pub mod puffin;
