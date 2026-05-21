@@ -34,7 +34,7 @@ use opendal::Scheme;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
+use crate::{OpenDalStorage, parse_chunk_size};
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
 
@@ -87,6 +87,8 @@ fn build_storage_for_scheme(
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
 ) -> Result<OpenDalStorage> {
+    #[allow(unused_variables)]
+    let chunk_size = parse_chunk_size(props)?;
     match parse_scheme(scheme)? {
         #[cfg(feature = "opendal-s3")]
         Scheme::S3 => {
@@ -95,6 +97,7 @@ fn build_storage_for_scheme(
                 configured_scheme: scheme.to_string(),
                 config: Arc::new(config),
                 customized_credential_load: customized_credential_load.clone(),
+                chunk_size,
             })
         }
         #[cfg(feature = "opendal-gcs")]
@@ -102,6 +105,7 @@ fn build_storage_for_scheme(
             let config = crate::gcs::gcs_config_parse(props.clone())?;
             Ok(OpenDalStorage::Gcs {
                 config: Arc::new(config),
+                chunk_size,
             })
         }
         #[cfg(feature = "opendal-oss")]
@@ -109,6 +113,7 @@ fn build_storage_for_scheme(
             let config = crate::oss::oss_config_parse(props.clone())?;
             Ok(OpenDalStorage::Oss {
                 config: Arc::new(config),
+                chunk_size,
             })
         }
         #[cfg(feature = "opendal-azdls")]
@@ -118,6 +123,7 @@ fn build_storage_for_scheme(
             Ok(OpenDalStorage::Azdls {
                 configured_scheme,
                 config: Arc::new(config),
+                chunk_size,
             })
         }
         #[cfg(feature = "opendal-fs")]

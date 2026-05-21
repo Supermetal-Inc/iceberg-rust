@@ -26,6 +26,9 @@ use super::storage::{
 };
 use crate::Result;
 
+/// Property key bounding the per-part size opendal sends to object stores.
+pub const IO_CHUNK_SIZE: &str = "io.write.chunk-size";
+
 /// FileIO implementation, used to manipulate files in underlying storage.
 ///
 /// FileIO wraps a `dyn Storage` with lazy initialization via `StorageFactory`.

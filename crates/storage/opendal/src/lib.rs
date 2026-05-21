@@ -34,8 +34,8 @@ use cfg_if::cfg_if;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
-    StorageFactory,
+    FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, InputFile, OutputFile, Storage,
+    StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
@@ -93,6 +93,20 @@ cfg_if! {
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
 
+pub(crate) fn parse_chunk_size(props: &HashMap<String, String>) -> Result<Option<usize>> {
+    props
+        .get(IO_CHUNK_SIZE)
+        .map(|s| {
+            s.parse::<usize>().map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid {IO_CHUNK_SIZE} value `{s}`: {e}"),
+                )
+            })
+        })
+        .transpose()
+}
+
 /// OpenDAL-based storage factory.
 ///
 /// Maps scheme to the corresponding OpenDalStorage storage variant.
@@ -148,20 +162,24 @@ impl StorageFactory for OpenDalStorageFactory {
                 configured_scheme: configured_scheme.clone(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
+                chunk_size: parse_chunk_size(config.props())?,
             })),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
+                chunk_size: parse_chunk_size(config.props())?,
             })),
             #[cfg(feature = "opendal-oss")]
             OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
+                chunk_size: parse_chunk_size(config.props())?,
             })),
             #[cfg(feature = "opendal-azdls")]
             OpenDalStorageFactory::Azdls { configured_scheme } => {
                 Ok(Arc::new(OpenDalStorage::Azdls {
                     configured_scheme: configured_scheme.clone(),
                     config: azdls_config_parse(config.props().clone())?.into(),
+                    chunk_size: parse_chunk_size(config.props())?,
                 }))
             }
             #[cfg(all(
@@ -206,18 +224,21 @@ pub enum OpenDalStorage {
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
+        chunk_size: Option<usize>,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
     Gcs {
         /// GCS configuration.
         config: Arc<GcsConfig>,
+        chunk_size: Option<usize>,
     },
     /// OSS storage variant.
     #[cfg(feature = "opendal-oss")]
     Oss {
         /// OSS configuration.
         config: Arc<OssConfig>,
+        chunk_size: Option<usize>,
     },
     /// Azure Data Lake Storage variant.
     /// Expects paths of the form
@@ -232,6 +253,7 @@ pub enum OpenDalStorage {
         configured_scheme: AzureStorageScheme,
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
+        chunk_size: Option<usize>,
     },
 }
 
@@ -277,6 +299,7 @@ impl OpenDalStorage {
                 configured_scheme,
                 config,
                 customized_credential_load,
+                ..
             } => {
                 let op = s3_config_build(config, customized_credential_load, path)?;
                 let op_info = op.info();
@@ -293,7 +316,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { config } => {
+            OpenDalStorage::Gcs { config, .. } => {
                 let operator = gcs_config_build(config, path)?;
                 let prefix = format!("gs://{}/", operator.info().name());
                 if path.starts_with(&prefix) {
@@ -306,7 +329,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { config } => {
+            OpenDalStorage::Oss { config, .. } => {
                 let op = oss_config_build(config, path)?;
                 let prefix = format!("oss://{}/", op.info().name());
                 if path.starts_with(&prefix) {
@@ -322,6 +345,7 @@ impl OpenDalStorage {
             OpenDalStorage::Azdls {
                 configured_scheme,
                 config,
+                ..
             } => azdls_create_operator(path, config, configured_scheme)?,
             #[cfg(all(
                 not(feature = "opendal-s3"),
@@ -342,6 +366,22 @@ impl OpenDalStorage {
         // harm in retrying temporary failures for other storage backends as well.
         let operator = operator.layer(RetryLayer::new());
         Ok((operator, relative_path))
+    }
+
+    /// Per-part chunk size for the writer, if configured. Returns `None` for
+    #[allow(unreachable_code, unused_variables)]
+    pub(crate) fn chunk_size(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorage::S3 { chunk_size, .. } => *chunk_size,
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorage::Gcs { chunk_size, .. } => *chunk_size,
+            #[cfg(feature = "opendal-oss")]
+            OpenDalStorage::Oss { chunk_size, .. } => *chunk_size,
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorage::Azdls { chunk_size, .. } => *chunk_size,
+            _ => None,
+        }
     }
 
     /// Extracts the relative path from an absolute path without building an operator.
@@ -419,6 +459,7 @@ impl OpenDalStorage {
             OpenDalStorage::Azdls {
                 configured_scheme,
                 config,
+                ..
             } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
                 match_path_with_config(&azure_path, config, configured_scheme)?;
@@ -482,9 +523,11 @@ impl Storage for OpenDalStorage {
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let (op, relative_path) = self.create_operator(&path)?;
-        Ok(Box::new(OpenDalWriter(
-            op.writer(relative_path).await.map_err(from_opendal_error)?,
-        )))
+        let writer = match self.chunk_size() {
+            Some(chunk_size) => op.writer_with(relative_path).chunk(chunk_size).await,
+            None => op.writer(relative_path).await,
+        };
+        Ok(Box::new(OpenDalWriter(writer.map_err(from_opendal_error)?)))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -634,6 +677,7 @@ mod tests {
             configured_scheme: "s3".to_string(),
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
+            chunk_size: None,
         };
 
         assert_eq!(
@@ -648,6 +692,7 @@ mod tests {
             configured_scheme: "s3a".to_string(),
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
+            chunk_size: None,
         };
         assert_eq!(
             storage_s3a
@@ -664,6 +709,7 @@ mod tests {
             configured_scheme: "s3".to_string(),
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
+            chunk_size: None,
         };
 
         // Scheme mismatch should error
@@ -679,6 +725,7 @@ mod tests {
     fn test_relativize_path_gcs() {
         let storage = OpenDalStorage::Gcs {
             config: Arc::new(GcsConfig::default()),
+            chunk_size: None,
         };
 
         assert_eq!(
@@ -694,6 +741,7 @@ mod tests {
     fn test_relativize_path_gcs_invalid_scheme() {
         let storage = OpenDalStorage::Gcs {
             config: Arc::new(GcsConfig::default()),
+            chunk_size: None,
         };
 
         assert!(
@@ -708,6 +756,7 @@ mod tests {
     fn test_relativize_path_oss() {
         let storage = OpenDalStorage::Oss {
             config: Arc::new(OssConfig::default()),
+            chunk_size: None,
         };
 
         assert_eq!(
@@ -723,6 +772,7 @@ mod tests {
     fn test_relativize_path_oss_invalid_scheme() {
         let storage = OpenDalStorage::Oss {
             config: Arc::new(OssConfig::default()),
+            chunk_size: None,
         };
 
         assert!(
@@ -742,6 +792,7 @@ mod tests {
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
+            chunk_size: None,
         };
 
         assert_eq!(
@@ -762,6 +813,7 @@ mod tests {
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
+            chunk_size: None,
         };
 
         // wasbs scheme doesn't match configured abfss
