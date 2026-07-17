@@ -28,6 +28,7 @@ use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
 
 const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+#[allow(dead_code)]
 const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
 
 /// Puffin blob property for deletion vector cardinality.
@@ -86,6 +87,11 @@ impl DeleteVector {
         self.inner.len()
     }
 
+    /// Returns whether this vector contains no deleted row positions.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     /// Serialize this delete vector into a Puffin deletion vector blob.
     pub(crate) fn to_puffin_blob(&self, properties: HashMap<String, String>) -> Result<Blob> {
         Self::check_properties(&properties)?;
@@ -131,6 +137,7 @@ impl DeleteVector {
     }
 
     /// Deserialize a delete vector from a Puffin deletion vector blob.
+    #[allow(dead_code)]
     pub(crate) fn from_puffin_blob(blob: Blob) -> Result<Self> {
         if blob.blob_type() != DELETION_VECTOR_V1 {
             return Err(Error::new(

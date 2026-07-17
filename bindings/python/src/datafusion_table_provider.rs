@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
+use iceberg::TableIdent;
 use iceberg::io::FileIOBuilder;
 use iceberg::table::StaticTable;
-use iceberg::TableIdent;
 use iceberg_datafusion::table::IcebergStaticTableProvider;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};

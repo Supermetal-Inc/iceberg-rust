@@ -101,7 +101,7 @@ impl RowDeltaAction {
                 }
             }
             if file.content_type() == DataContentType::EqualityDeletes
-                && file.equality_ids().map_or(true, |ids| ids.is_empty())
+                && file.equality_ids().is_none_or(|ids| ids.is_empty())
             {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,

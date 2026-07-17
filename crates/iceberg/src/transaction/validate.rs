@@ -116,15 +116,15 @@ pub(crate) trait SnapshotValidator {
             }
         }
 
-        if last_snapshot.is_some()
-            && last_snapshot.clone().unwrap().parent_snapshot_id() != from_snapshot_id
+        if let Some(last_snapshot) = last_snapshot
+            && last_snapshot.parent_snapshot_id() != from_snapshot_id
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
                     "Cannot determine history between starting snapshot {} and the last known ancestor {}",
                     from_snapshot_id.unwrap_or(-1),
-                    last_snapshot.unwrap().snapshot_id()
+                    last_snapshot.snapshot_id()
                 ),
             ));
         }
