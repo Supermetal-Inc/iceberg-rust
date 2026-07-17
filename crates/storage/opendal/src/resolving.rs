@@ -34,9 +34,9 @@ use opendal::Scheme;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{OpenDalStorage, parse_chunk_size};
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{OpenDalStorage, parse_chunk_size};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";

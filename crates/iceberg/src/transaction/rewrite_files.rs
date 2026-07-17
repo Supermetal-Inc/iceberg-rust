@@ -25,8 +25,7 @@ use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, Snapshot
 use super::{ActionCommit, TransactionAction};
 use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{
-    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation,
+    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
 };
 use crate::table::Table;
 use crate::transaction::validate::SnapshotValidator;
@@ -336,10 +335,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 entry.status() != ManifestStatus::Deleted
                     && !found_files_to_delete.contains(entry.data_file().file_path())
             }) {
-                let mut manifest_writer = snapshot_producer.new_manifest_writer(
-                    manifest_file.content,
-                    manifest_file.partition_spec_id,
-                )?;
+                let mut manifest_writer = snapshot_producer
+                    .new_manifest_writer(manifest_file.content, manifest_file.partition_spec_id)?;
 
                 manifest
                     .entries()

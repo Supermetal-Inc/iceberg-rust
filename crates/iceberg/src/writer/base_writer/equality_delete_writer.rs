@@ -104,7 +104,10 @@ impl EqualityDeleteWriterConfig {
             },
             // Variant's inner binary fields carry no field id.
             |field: &Field| {
-                field.metadata().get(EXTENSION_TYPE_NAME_KEY).map(String::as_str)
+                field
+                    .metadata()
+                    .get(EXTENSION_TYPE_NAME_KEY)
+                    .map(String::as_str)
                     != Some(ParquetVariantType::NAME)
             },
         )?;
