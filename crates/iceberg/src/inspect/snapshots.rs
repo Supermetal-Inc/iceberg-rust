@@ -136,9 +136,11 @@ impl<'a> SnapshotsTable<'a> {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::TimestampMicrosecondArray;
     use expect_test::expect;
     use futures::TryStreamExt;
 
+    use crate::arrow::UTC_TIME_ZONE;
     use crate::scan::tests::TableTestFixture;
     use crate::test_utils::check_record_batches;
 
@@ -148,8 +150,25 @@ mod tests {
 
         let batch_stream = table.inspect().snapshots().scan().await.unwrap();
 
+        let batches = batch_stream.try_collect::<Vec<_>>().await.unwrap();
+        let mut committed_at_values = Vec::new();
+        for batch in &batches {
+            let committed_at = batch
+                .column_by_name("committed_at")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert_eq!(committed_at.timezone(), Some(UTC_TIME_ZONE));
+            committed_at_values.extend(committed_at.iter());
+        }
+        assert_eq!(committed_at_values, vec![
+            Some(1515100955770000),
+            Some(1555100955770000)
+        ]);
+
         check_record_batches(
-            batch_stream.try_collect::<Vec<_>>().await.unwrap(),
+            batches,
             expect![[r#"
                 Field { "committed_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
@@ -158,11 +177,7 @@ mod tests {
                 Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
                 Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
             expect![[r#"
-                committed_at: PrimitiveArray<Timestamp(µs, "UTC")>
-                [
-                  2018-01-04T21:22:35.770 (Unknown Time Zone 'UTC'),
-                  2019-04-12T20:29:15.770 (Unknown Time Zone 'UTC'),
-                ],
+                committed_at: (skipped),
                 snapshot_id: PrimitiveArray<Int64>
                 [
                   3051729675574597004,
@@ -210,7 +225,7 @@ mod tests {
                 ]
                 ],
                 ]"#]],
-            &["manifest_list"],
+            &["committed_at", "manifest_list"],
             Some("committed_at"),
         );
     }
