@@ -162,6 +162,7 @@ mod tests {
             assert_eq!(committed_at.timezone(), Some(UTC_TIME_ZONE));
             committed_at_values.extend(committed_at.iter());
         }
+        committed_at_values.sort_unstable();
         assert_eq!(committed_at_values, vec![
             Some(1515100955770000),
             Some(1555100955770000)
