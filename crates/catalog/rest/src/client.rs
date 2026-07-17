@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
@@ -28,13 +29,28 @@ use tokio::sync::Mutex;
 use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
 
+#[derive(Clone)]
+struct AuthToken {
+    value: String,
+    expires_at: Option<Instant>,
+}
+
+impl AuthToken {
+    fn without_expiry(value: String) -> Self {
+        Self {
+            value,
+            expires_at: None,
+        }
+    }
+}
+
 pub(crate) struct HttpClient {
     client: Client,
 
     /// The token to be used for authentication.
     ///
     /// It's possible to fetch the token from the server while needed.
-    token: Mutex<Option<String>>,
+    token: Mutex<Option<AuthToken>>,
     /// The token endpoint to be used for authentication.
     token_endpoint: String,
     /// The credential to be used for authentication.
@@ -62,7 +78,7 @@ impl HttpClient {
         let extra_headers = cfg.extra_headers()?;
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
-            token: Mutex::new(cfg.token()),
+            token: Mutex::new(cfg.token().map(AuthToken::without_expiry)),
             token_endpoint: cfg.get_token_endpoint(),
             credential: cfg.credential(),
             extra_headers,
@@ -82,7 +98,11 @@ impl HttpClient {
             .unwrap_or(self.extra_headers);
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
-            token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
+            token: Mutex::new(
+                cfg.token()
+                    .map(AuthToken::without_expiry)
+                    .or_else(|| self.token.into_inner()),
+            ),
             token_endpoint: if !cfg.get_token_endpoint().is_empty() {
                 cfg.get_token_endpoint()
             } else {
@@ -107,10 +127,14 @@ impl HttpClient {
             .build()
             .unwrap();
         self.authenticate(&mut req).await.ok();
-        self.token.lock().await.clone()
+        self.token
+            .lock()
+            .await
+            .as_ref()
+            .map(|token| token.value.clone())
     }
 
-    async fn exchange_credential_for_token(&self) -> Result<String> {
+    async fn exchange_credential_for_token(&self) -> Result<AuthToken> {
         // Credential must exist here.
         let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
             Error::new(
@@ -142,6 +166,9 @@ impl HttpClient {
             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         let auth_url = auth_req.url().clone();
+        // Measure `expires_in` from request start so network latency shortens,
+        // rather than extends, the token's local lifetime.
+        let requested_at = Instant::now();
         let auth_resp = self.client.execute(auth_req).await?;
 
         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
@@ -175,7 +202,13 @@ impl HttpClient {
             })?;
             Err(Error::from(e))
         }?;
-        Ok(auth_res.access_token)
+        let expires_at = auth_res
+            .expires_in
+            .and_then(|seconds| requested_at.checked_add(Duration::from_secs(seconds)));
+        Ok(AuthToken {
+            value: auth_res.access_token,
+            expires_at,
+        })
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -193,8 +226,16 @@ impl HttpClient {
     /// the current token unchanged.
     pub(crate) async fn regenerate_token(&self) -> Result<()> {
         let new_token = self.exchange_credential_for_token().await?;
-        *self.token.lock().await = Some(new_token.clone());
+        *self.token.lock().await = Some(new_token);
         Ok(())
+    }
+
+    pub(crate) async fn token_expires_at(&self) -> Option<Instant> {
+        self.token
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|token| token.expires_at)
     }
 
     /// Authenticates the request by adding a bearer token to the authorization header.
@@ -218,13 +259,14 @@ impl HttpClient {
 
         // Either use the provided token or exchange credential for token, cache and use that
         let token = match token {
-            Some(token) => token,
+            Some(token) => token.value,
             None => {
                 let token = self.exchange_credential_for_token().await?;
                 // Update token so that we use it for next request instead of
                 // exchanging credential for token from the server again
-                *self.token.lock().await = Some(token.clone());
-                token
+                let value = token.value.clone();
+                *self.token.lock().await = Some(token);
+                value
             }
         };
 

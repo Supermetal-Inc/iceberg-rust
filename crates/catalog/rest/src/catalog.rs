@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
@@ -488,6 +489,13 @@ impl RestCatalog {
     /// the current token unchanged.
     pub async fn regenerate_token(&self) -> Result<()> {
         self.context().await?.client.regenerate_token().await
+    }
+
+    /// Returns the local monotonic deadline derived from OAuth `expires_in`.
+    ///
+    /// Returns `None` when the cached token has no reported lifetime.
+    pub async fn token_expires_at(&self) -> Result<Option<Instant>> {
+        Ok(self.context().await?.client.token_expires_at().await)
     }
 }
 
@@ -1258,6 +1266,31 @@ mod tests {
         let token = catalog.context().await.unwrap().client.token().await;
         oauth_mock.assert_async().await;
         assert_eq!(token, Some("ey000000000001".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_token_expiry() {
+        let mut server = Server::new_async().await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let before = Instant::now();
+        let expires_at = catalog.token_expires_at().await.unwrap().unwrap();
+
+        oauth_mock.assert_async().await;
+        config_mock.assert_async().await;
+        assert!(expires_at > before + std::time::Duration::from_secs(86_399));
+        assert!(expires_at <= Instant::now() + std::time::Duration::from_secs(86_400));
     }
 
     #[tokio::test]
