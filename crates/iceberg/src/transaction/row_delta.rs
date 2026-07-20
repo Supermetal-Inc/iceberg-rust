@@ -101,7 +101,7 @@ impl RowDeltaAction {
                 }
             }
             if file.content_type() == DataContentType::EqualityDeletes
-                && file.equality_ids().map_or(true, |ids| ids.is_empty())
+                && file.equality_ids().is_none_or(|ids| ids.is_empty())
             {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
@@ -363,7 +363,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::TableIdent;
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, ManifestStatus,
         Operation, Snapshot, Struct, TableMetadataBuilder,
@@ -371,7 +370,7 @@ mod tests {
     use crate::table::Table;
     use crate::transaction::tests::make_v2_minimal_table;
     use crate::transaction::{Transaction, TransactionAction};
-    use crate::{Error, TableUpdate};
+    use crate::{Error, TableIdent, TableUpdate};
 
     fn data_file(path: &str, table: &crate::table::Table) -> crate::spec::DataFile {
         DataFileBuilder::default()
@@ -568,15 +567,13 @@ mod tests {
     }
 
     async fn table_with_snapshot(base: &Table, snapshot: Snapshot) -> Table {
-        let updated = TableMetadataBuilder::new_from_metadata(
-            base.metadata_ref().as_ref().clone(),
-            None,
-        )
-        .set_branch_snapshot(snapshot, MAIN_BRANCH)
-        .unwrap()
-        .build()
-        .unwrap()
-        .metadata;
+        let updated =
+            TableMetadataBuilder::new_from_metadata(base.metadata_ref().as_ref().clone(), None)
+                .set_branch_snapshot(snapshot, MAIN_BRANCH)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
 
         Table::builder()
             .metadata(updated)

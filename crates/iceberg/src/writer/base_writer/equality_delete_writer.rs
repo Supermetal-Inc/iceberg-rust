@@ -104,7 +104,10 @@ impl EqualityDeleteWriterConfig {
             },
             // Variant's inner binary fields carry no field id.
             |field: &Field| {
-                field.metadata().get(EXTENSION_TYPE_NAME_KEY).map(String::as_str)
+                field
+                    .metadata()
+                    .get(EXTENSION_TYPE_NAME_KEY)
+                    .map(String::as_str)
                     != Some(ParquetVariantType::NAME)
             },
         )?;
@@ -218,7 +221,7 @@ mod test {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+    use crate::arrow::{UTC_TIME_ZONE, arrow_schema_to_schema, schema_to_arrow_schema};
     use crate::io::FileIO;
     use crate::spec::{
         DataFile, DataFileFormat, ListType, MapType, NestedField, PrimitiveType, Schema,
@@ -644,7 +647,7 @@ mod test {
         ])) as ArrayRef;
         let col7 = Arc::new(
             arrow_array::TimestampMicrosecondArray::from(vec![Some(0), Some(1), Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col8 = Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
             Some(0),
@@ -653,7 +656,7 @@ mod test {
         ])) as ArrayRef;
         let col9 = Arc::new(
             arrow_array::TimestampNanosecondArray::from(vec![Some(0), Some(1), Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(UTC_TIME_ZONE),
         ) as ArrayRef;
         let col10 = Arc::new(arrow_array::StringArray::from(vec![
             Some("a"),

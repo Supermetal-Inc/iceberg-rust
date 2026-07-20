@@ -84,11 +84,7 @@ impl<L: LocationGenerator, F: FileNameGenerator> DeletionVectorWriter<L, F> {
     /// Register a fully merged `DeleteVector` for `referenced_file`.
     /// Rejects duplicates so a `write_bitmap` call cannot silently
     /// overwrite a bitmap built up by prior `write` calls.
-    pub fn write_bitmap(
-        &mut self,
-        referenced_file: String,
-        vector: DeleteVector,
-    ) -> Result<()> {
+    pub fn write_bitmap(&mut self, referenced_file: String, vector: DeleteVector) -> Result<()> {
         if self.delete_vectors.contains_key(&referenced_file) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -133,7 +129,7 @@ where
         let mut data_files = Vec::with_capacity(delete_vectors.len());
 
         for (data_file_path, delete_vector) in delete_vectors {
-            if delete_vector.len() == 0 {
+            if delete_vector.is_empty() {
                 continue;
             }
             let file_name = self.file_name_generator.generate_file_name();

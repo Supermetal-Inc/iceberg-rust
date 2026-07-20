@@ -72,9 +72,7 @@ where
 
     /// Sum of `current_written_size` across every live partition writer.
     pub fn total_written_size(&self) -> usize
-    where
-        B::R: CurrentFileStatus,
-    {
+    where B::R: CurrentFileStatus {
         self.partition_writers
             .values()
             .map(|w| w.current_written_size())

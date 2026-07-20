@@ -21,12 +21,15 @@
 //! The Spark 4.0 provisioner creates `rest.default.test_variant_column` with a
 //! `VARIANT` column containing three rows of JSON data.
 
+use std::sync::Arc;
+
 use arrow_schema::DataType;
 use futures::TryStreamExt;
 use iceberg::spec::Type;
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_integration_tests::get_test_fixture;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 
 /// Verifies that a table written by Spark with a VARIANT column has its schema
 /// parsed into `Type::Variant` by the Rust iceberg implementation.
@@ -34,6 +37,10 @@ use iceberg_integration_tests::get_test_fixture;
 async fn test_variant_schema_is_parsed() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
@@ -62,6 +69,10 @@ async fn test_variant_schema_is_parsed() {
 async fn test_variant_arrow_schema() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();
@@ -124,6 +135,10 @@ async fn test_variant_arrow_schema() {
 async fn test_variant_projected_with_primitive_columns() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
         .load("rest", fixture.catalog_config.clone())
         .await
         .unwrap();

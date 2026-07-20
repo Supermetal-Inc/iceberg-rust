@@ -757,13 +757,15 @@ pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send
             Ok(Arc::new(TimestampMicrosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(value)) => Ok(Arc::new(Scalar::new(
-            TimestampMicrosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
+            TimestampMicrosecondArray::new(vec![*value; 1].into(), None)
+                .with_timezone(UTC_TIME_ZONE),
         ))),
         (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(value)) => {
             Ok(Arc::new(TimestampNanosecondArray::new_scalar(*value)))
         }
         (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(value)) => Ok(Arc::new(Scalar::new(
-            TimestampNanosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
+            TimestampNanosecondArray::new(vec![*value; 1].into(), None)
+                .with_timezone(UTC_TIME_ZONE),
         ))),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
             let array = Decimal128Array::from_value(*value, 1)
@@ -1665,13 +1667,13 @@ mod tests {
             simple_field("i", DataType::Time64(TimeUnit::Microsecond), false, "9"),
             simple_field(
                 "j",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
                 false,
                 "10",
             ),
             simple_field(
                 "k",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
                 false,
                 "12",
             ),
@@ -1722,7 +1724,8 @@ mod tests {
                 ])),
                 true,
                 "31",
-            ),
+            )
+            .with_extension_type(ParquetVariantType),
         ])
     }
 
@@ -2159,7 +2162,7 @@ mod tests {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             assert!(is_scalar);
-            assert_eq!(array.timezone(), Some("+00:00"));
+            assert_eq!(array.timezone(), Some(UTC_TIME_ZONE));
             assert_eq!(array.value(0), 42);
         }
         {
