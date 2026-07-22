@@ -54,7 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
-mod rewrite_files;
+mod replace_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -76,7 +76,7 @@ use crate::spec::TableProperties;
 use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
-use crate::transaction::rewrite_files::RewriteFilesAction;
+use crate::transaction::replace_files::{OverwriteFilesAction, RewriteFilesAction};
 use crate::transaction::row_delta::RowDeltaAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
@@ -162,6 +162,11 @@ impl Transaction {
     /// Rewrite a set of data files of table
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new()
+    }
+
+    /// Overwrite a set of data files of table.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
     }
 
     /// Row delta. Adds data files and delete files, and optionally marks

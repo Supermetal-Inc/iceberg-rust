@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,8 +31,31 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::validate::SnapshotValidator;
 
-/// Transaction action for rewriting files.
-pub struct RewriteFilesAction {
+/// Which snapshot operation a file replacement records.
+///
+/// Rewrites and overwrites share the same manifest handling but have different
+/// logical meanings in the Iceberg snapshot summary.
+pub(crate) trait ReplaceFilesMode: Send + Sync + 'static {
+    const OPERATION: Operation;
+}
+
+/// Files were replaced without changing table data.
+pub struct Rewrite;
+
+/// Files were replaced as a logical overwrite.
+pub struct Overwrite;
+
+impl ReplaceFilesMode for Rewrite {
+    const OPERATION: Operation = Operation::Replace;
+}
+
+impl ReplaceFilesMode for Overwrite {
+    const OPERATION: Operation = Operation::Overwrite;
+}
+
+/// Transaction action for replacing files.
+#[allow(private_bounds)]
+pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -41,18 +65,27 @@ pub struct RewriteFilesAction {
     deleted_delete_files: Vec<DataFile>,
     data_sequence_number: Option<i64>,
     starting_snapshot_id: Option<i64>,
+    _mode: PhantomData<M>,
 }
 
-pub struct RewriteFilesOperation {
+/// Rewrites files without changing table data.
+pub type RewriteFilesAction = ReplaceFilesAction<Rewrite>;
+
+/// Replaces files as a logical overwrite.
+pub type OverwriteFilesAction = ReplaceFilesAction<Overwrite>;
+
+struct ReplaceFilesOperation<M: ReplaceFilesMode> {
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
     deleted_delete_files: Vec<DataFile>,
     starting_snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    _mode: PhantomData<M>,
 }
 
-impl RewriteFilesAction {
+#[allow(private_bounds)]
+impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
     pub fn new() -> Self {
         Self {
             commit_uuid: None,
@@ -64,6 +97,7 @@ impl RewriteFilesAction {
             deleted_delete_files: vec![],
             data_sequence_number: None,
             starting_snapshot_id: None,
+            _mode: PhantomData,
         }
     }
 
@@ -132,14 +166,14 @@ impl RewriteFilesAction {
     }
 }
 
-impl Default for RewriteFilesAction {
+impl<M: ReplaceFilesMode> Default for ReplaceFilesAction<M> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl TransactionAction for RewriteFilesAction {
+impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -152,18 +186,19 @@ impl TransactionAction for RewriteFilesAction {
             self.deleted_delete_files.clone(),
         );
 
-        let rewrite_operation = RewriteFilesOperation {
+        let replace_operation = ReplaceFilesOperation::<M> {
             added_data_files: self.added_data_files.clone(),
             added_delete_files: self.added_delete_files.clone(),
             deleted_data_files: self.deleted_data_files.clone(),
             deleted_delete_files: self.deleted_delete_files.clone(),
             starting_snapshot_id: self.starting_snapshot_id,
             data_sequence_number: self.data_sequence_number,
+            _mode: PhantomData,
         };
 
         // todo should be able to configure to use the merge manifest process
         snapshot_producer
-            .commit(rewrite_operation, DefaultManifestProcess)
+            .commit(replace_operation, DefaultManifestProcess)
             .await
     }
 }
@@ -179,7 +214,7 @@ fn copy_with_deleted_status(entry: &ManifestEntry) -> Result<ManifestEntry> {
     Ok(builder.build())
 }
 
-impl SnapshotValidator for RewriteFilesOperation {
+impl<M: ReplaceFilesMode> SnapshotValidator for ReplaceFilesOperation<M> {
     async fn validate(&self, base: &Table, parent_snapshot_id: Option<i64>) -> Result<()> {
         // Validate replaced and added files
         if self.deleted_data_files.is_empty() && self.deleted_delete_files.is_empty() {
@@ -218,9 +253,9 @@ impl SnapshotValidator for RewriteFilesOperation {
     }
 }
 
-impl SnapshotProduceOperation for RewriteFilesOperation {
+impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> {
     fn operation(&self) -> Operation {
-        Operation::Replace
+        M::OPERATION.clone()
     }
 
     async fn delete_entries(
@@ -352,5 +387,17 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         }
 
         Ok(existing_files)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Overwrite, ReplaceFilesMode, Rewrite};
+    use crate::spec::Operation;
+
+    #[test]
+    fn modes_map_to_snapshot_operations() {
+        assert_eq!(Rewrite::OPERATION, Operation::Replace);
+        assert_eq!(Overwrite::OPERATION, Operation::Overwrite);
     }
 }
