@@ -67,6 +67,11 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync + SnapshotValidator {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether this operation replaces the complete logical table contents.
+    fn is_full_table_overwrite(&self) -> bool {
+        false
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     fn delete_entries(
         &self,
@@ -397,6 +402,7 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
+        deleted_entries: Vec<ManifestEntry>,
     ) -> Result<Vec<ManifestFile>> {
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
@@ -428,9 +434,7 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        let delete_manifests = self
-            .write_deleted_manifest(snapshot_produce_operation.delete_entries(self).await?)
-            .await?;
+        let delete_manifests = self.write_deleted_manifest(deleted_entries).await?;
         manifest_files.extend(delete_manifests);
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
@@ -441,6 +445,7 @@ impl<'a> SnapshotProducer<'a> {
     fn summary<OP: SnapshotProduceOperation>(
         &self,
         snapshot_produce_operation: &OP,
+        deleted_entries: &[ManifestEntry],
     ) -> Result<Summary> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
@@ -477,16 +482,9 @@ impl<'a> SnapshotProducer<'a> {
         }
 
         let operation = snapshot_produce_operation.operation();
-        for data_file in &self.deleted_data_files {
+        for entry in deleted_entries {
             summary_collector.remove_file(
-                data_file,
-                table_metadata.current_schema().clone(),
-                table_metadata.default_partition_spec().clone(),
-            );
-        }
-        for delete_file in &self.deleted_delete_files {
-            summary_collector.remove_file(
-                delete_file,
+                entry.data_file(),
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
@@ -502,7 +500,11 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()))
+        update_snapshot_summaries(
+            summary,
+            previous_snapshot.map(|s| s.summary()),
+            snapshot_produce_operation.is_full_table_overwrite(),
+        )
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
@@ -558,15 +560,20 @@ impl<'a> SnapshotProducer<'a> {
             ),
         };
 
+        let deleted_entries = snapshot_produce_operation.delete_entries(&self).await?;
+
         // Calling self.summary() before self.manifest_file() is important because self.added_data_files
         // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
         // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
+        let summary = self
+            .summary(&snapshot_produce_operation, &deleted_entries)
+            .map_err(|err| {
+                Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.")
+                    .with_source(err)
+            })?;
 
         let new_manifests = self
-            .manifest_file(&snapshot_produce_operation, &process)
+            .manifest_file(&snapshot_produce_operation, &process, deleted_entries)
             .await?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;

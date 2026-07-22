@@ -65,6 +65,7 @@ pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     deleted_delete_files: Vec<DataFile>,
     data_sequence_number: Option<i64>,
     starting_snapshot_id: Option<i64>,
+    full_table_overwrite: bool,
     _mode: PhantomData<M>,
 }
 
@@ -81,6 +82,7 @@ struct ReplaceFilesOperation<M: ReplaceFilesMode> {
     deleted_delete_files: Vec<DataFile>,
     starting_snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    full_table_overwrite: bool,
     _mode: PhantomData<M>,
 }
 
@@ -97,6 +99,7 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
             deleted_delete_files: vec![],
             data_sequence_number: None,
             starting_snapshot_id: None,
+            full_table_overwrite: false,
             _mode: PhantomData,
         }
     }
@@ -166,6 +169,14 @@ impl<M: ReplaceFilesMode> ReplaceFilesAction<M> {
     }
 }
 
+impl ReplaceFilesAction<Overwrite> {
+    /// Mark this overwrite as replacing the complete logical table contents.
+    pub fn full_table_overwrite(mut self) -> Self {
+        self.full_table_overwrite = true;
+        self
+    }
+}
+
 impl<M: ReplaceFilesMode> Default for ReplaceFilesAction<M> {
     fn default() -> Self {
         Self::new()
@@ -193,6 +204,7 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             deleted_delete_files: self.deleted_delete_files.clone(),
             starting_snapshot_id: self.starting_snapshot_id,
             data_sequence_number: self.data_sequence_number,
+            full_table_overwrite: self.full_table_overwrite,
             _mode: PhantomData,
         };
 
@@ -256,6 +268,10 @@ impl<M: ReplaceFilesMode> SnapshotValidator for ReplaceFilesOperation<M> {
 impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> {
     fn operation(&self) -> Operation {
         M::OPERATION.clone()
+    }
+
+    fn is_full_table_overwrite(&self) -> bool {
+        self.full_table_overwrite
     }
 
     async fn delete_entries(
@@ -367,8 +383,7 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                 // All files from the existing manifest entries are still valid
                 existing_files.push(manifest_file.clone());
             } else if manifest.entries().iter().any(|entry| {
-                entry.status() != ManifestStatus::Deleted
-                    && !found_files_to_delete.contains(entry.data_file().file_path())
+                entry.is_alive() && !found_files_to_delete.contains(entry.data_file().file_path())
             }) {
                 let mut manifest_writer = snapshot_producer
                     .new_manifest_writer(manifest_file.content, manifest_file.partition_spec_id)?;
@@ -377,10 +392,10 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                     .entries()
                     .iter()
                     .filter(|entry| {
-                        entry.status() != ManifestStatus::Deleted
+                        entry.is_alive()
                             && !found_files_to_delete.contains(entry.data_file().file_path())
                     })
-                    .try_for_each(|entry| manifest_writer.add_entry((**entry).clone()))?;
+                    .try_for_each(|entry| manifest_writer.add_existing_entry((**entry).clone()))?;
 
                 existing_files.push(manifest_writer.write_manifest_file().await?);
             }

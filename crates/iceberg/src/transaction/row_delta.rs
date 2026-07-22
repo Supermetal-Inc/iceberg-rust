@@ -597,6 +597,9 @@ mod tests {
     async fn remove_delete_file_rewrites_manifest_and_preserves_sequence_numbers() {
         let base = make_v2_minimal_table();
         let prior = pos_delete_v2("test/prior.parquet", &base);
+        let mut prior_shell = prior.clone();
+        prior_shell.file_size_in_bytes = 0;
+        prior_shell.record_count = 0;
         let survivor = pos_delete_v2("test/survivor.parquet", &base);
 
         let mut commit_s1 = Arc::new(
@@ -615,7 +618,7 @@ mod tests {
             Transaction::new(&table_s1)
                 .row_delta()
                 .add_data_files(vec![data_file("test/new.parquet", &table_s1)])
-                .remove_delete_files(vec![prior.clone()]),
+                .remove_delete_files(vec![prior_shell]),
         )
         .commit(&table_s1)
         .await
@@ -624,6 +627,22 @@ mod tests {
         assert_eq!(extract_operation(&updates_s2), Operation::Append);
 
         let snap_s2 = first_snapshot(updates_s2);
+        assert_eq!(
+            snap_s2
+                .summary()
+                .additional_properties
+                .get("removed-position-deletes")
+                .unwrap(),
+            "5"
+        );
+        assert_eq!(
+            snap_s2
+                .summary()
+                .additional_properties
+                .get("total-position-deletes")
+                .unwrap(),
+            "5"
+        );
         let manifests = snap_s2
             .load_manifest_list(table_s1.file_io(), table_s1.metadata())
             .await

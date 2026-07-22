@@ -333,6 +333,7 @@ where T: PartialOrd + Default + ToString {
 pub(crate) fn update_snapshot_summaries(
     mut summary: Summary,
     previous_summary: Option<&Summary>,
+    full_table_overwrite: bool,
 ) -> Result<Summary> {
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
@@ -343,6 +344,13 @@ pub(crate) fn update_snapshot_summaries(
             ErrorKind::DataInvalid,
             "Operation is not supported.",
         ));
+    }
+
+    if let Some(previous_summary) = previous_summary
+        && full_table_overwrite
+        && summary.operation == Operation::Overwrite
+    {
+        reset_full_table_summary(&mut summary, previous_summary);
     }
 
     update_totals(
@@ -393,6 +401,28 @@ pub(crate) fn update_snapshot_summaries(
         REMOVED_EQUALITY_DELETES,
     );
     Ok(summary)
+}
+
+fn reset_full_table_summary(summary: &mut Summary, previous_summary: &Summary) {
+    for (total_property, removed_property) in [
+        (TOTAL_DATA_FILES, DELETED_DATA_FILES),
+        (TOTAL_DELETE_FILES, REMOVED_DELETE_FILES),
+        (TOTAL_RECORDS, DELETED_RECORDS),
+        (TOTAL_FILE_SIZE, REMOVED_FILE_SIZE),
+        (TOTAL_POSITION_DELETES, REMOVED_POSITION_DELETES),
+        (TOTAL_EQUALITY_DELETES, REMOVED_EQUALITY_DELETES),
+    ] {
+        let previous_total = previous_summary
+            .additional_properties
+            .get(total_property)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        if previous_total != 0 {
+            summary
+                .additional_properties
+                .insert(removed_property.to_string(), previous_total.to_string());
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -481,7 +511,7 @@ mod tests {
             additional_properties: new_props,
         };
 
-        let updated = update_snapshot_summaries(summary, Some(&previous_summary)).unwrap();
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
 
         assert_eq!(
             updated.additional_properties.get(TOTAL_DATA_FILES).unwrap(),
@@ -515,6 +545,47 @@ mod tests {
                 .get(TOTAL_EQUALITY_DELETES)
                 .unwrap(),
             "4"
+        );
+    }
+
+    #[test]
+    fn test_full_table_overwrite_resets_totals() {
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+                (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+                (TOTAL_RECORDS.to_string(), "100".to_string()),
+                (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+                (TOTAL_POSITION_DELETES.to_string(), "30".to_string()),
+                (TOTAL_EQUALITY_DELETES.to_string(), "20".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), true).unwrap();
+
+        for property in [
+            TOTAL_DATA_FILES,
+            TOTAL_DELETE_FILES,
+            TOTAL_RECORDS,
+            TOTAL_FILE_SIZE,
+            TOTAL_POSITION_DELETES,
+            TOTAL_EQUALITY_DELETES,
+        ] {
+            assert_eq!(updated.additional_properties.get(property).unwrap(), "0");
+        }
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(REMOVED_POSITION_DELETES)
+                .unwrap(),
+            "30"
         );
     }
 
