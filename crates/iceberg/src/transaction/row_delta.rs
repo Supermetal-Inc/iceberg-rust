@@ -36,6 +36,7 @@ use crate::{Error, ErrorKind};
 
 /// Row level changes packed into one snapshot.
 pub struct RowDeltaAction {
+    check_duplicate: bool,
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
@@ -47,6 +48,7 @@ pub struct RowDeltaAction {
 impl RowDeltaAction {
     pub(crate) fn new() -> Self {
         Self {
+            check_duplicate: false,
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
@@ -54,6 +56,13 @@ impl RowDeltaAction {
             added_delete_files: vec![],
             removed_delete_files: vec![],
         }
+    }
+
+    /// Set whether to reject files already referenced by the table.
+    /// The check reads the current snapshot's manifests and is disabled by default.
+    pub fn with_check_duplicate(mut self, value: bool) -> Self {
+        self.check_duplicate = value;
+        self
     }
 
     pub fn add_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
@@ -187,6 +196,10 @@ impl TransactionAction for RowDeltaAction {
 
         snapshot_producer.validate_added_data_files(&self.added_data_files)?;
         snapshot_producer.validate_added_data_files(&self.added_delete_files)?;
+
+        if self.check_duplicate {
+            snapshot_producer.validate_duplicate_files().await?;
+        }
 
         let operation = RowDeltaOperation {
             has_added_data: !self.added_data_files.is_empty(),
@@ -448,6 +461,36 @@ mod tests {
         let mut commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Overwrite);
+    }
+
+    #[tokio::test]
+    async fn duplicate_check_rejects_referenced_delete_file() {
+        let base = make_v2_minimal_table();
+        let delete = pos_delete_v2("test/delete.parquet", &base);
+
+        let mut first_commit = Arc::new(
+            Transaction::new(&base)
+                .row_delta()
+                .add_delete_files(vec![delete.clone()]),
+        )
+        .commit(&base)
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&base, first_snapshot(first_commit.take_updates())).await;
+
+        let result = Arc::new(
+            Transaction::new(&table)
+                .row_delta()
+                .with_check_duplicate(true)
+                .add_delete_files(vec![delete]),
+        )
+        .commit(&table)
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected duplicate delete file to be rejected"),
+        };
+        assert!(error.to_string().contains("test/delete.parquet"));
     }
 
     #[tokio::test]
