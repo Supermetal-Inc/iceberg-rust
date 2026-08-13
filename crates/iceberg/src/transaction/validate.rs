@@ -157,8 +157,9 @@ pub(crate) trait SnapshotValidator {
         data_files: &[DataFile],
         ignore_equality_deletes: bool,
     ) -> Result<()> {
-        // If there is no current table state, no files have been added
-        if to_snapshot_id.is_none() || base.metadata().format_version() != FormatVersion::V1 {
+        // Without a current snapshot, the table has no files. V1 tables
+        // cannot contain row delete files.
+        if to_snapshot_id.is_none() || base.metadata().format_version() == FormatVersion::V1 {
             return Ok(());
         }
         let to_snapshot_id = to_snapshot_id.unwrap();
