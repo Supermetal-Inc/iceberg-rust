@@ -209,6 +209,20 @@ impl Transaction {
         .1
     }
 
+    /// Build and submit this transaction once using its original table metadata.
+    ///
+    /// Unlike [`Transaction::commit`], this method does not reload the table,
+    /// rebase the transaction, or retry a failed catalog update. A concurrent
+    /// catalog update therefore returns directly to the caller, which can
+    /// rebuild the transaction against fresh table metadata before retrying.
+    pub async fn commit_once(self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.actions.is_empty() {
+            return Ok(self.table);
+        }
+
+        self.commit_current(catalog).await
+    }
+
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
             .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
@@ -231,6 +245,10 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
+        self.commit_current(catalog).await
+    }
+
+    async fn commit_current(&self, catalog: &dyn Catalog) -> Result<Table> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -526,6 +544,31 @@ mod tests {
             assert_eq!(err.message(), "Commit conflict");
             assert!(err.retryable(), "Error should be retryable");
         }
+    }
+
+    #[tokio::test]
+    async fn test_commit_once_does_not_reload_or_retry() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+        let mut mock_catalog = MockCatalog::new();
+
+        mock_catalog.expect_load_table().times(0);
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async {
+                    Err(
+                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                            .with_retryable(true),
+                    )
+                })
+            });
+
+        let error = tx.commit_once(&mock_catalog).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
     }
 }
 
