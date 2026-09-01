@@ -378,38 +378,13 @@ mod tests {
 
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, ManifestStatus,
-        Operation, Snapshot, Struct, TableMetadataBuilder,
+        Operation, Struct,
     };
-    use crate::table::Table;
-    use crate::transaction::tests::make_v2_minimal_table;
+    use crate::transaction::tests::{
+        data_file, first_snapshot, make_v2_minimal_table, pos_delete_v2, table_with_snapshot,
+    };
     use crate::transaction::{Transaction, TransactionAction};
-    use crate::{Error, TableIdent, TableUpdate};
-
-    fn data_file(path: &str, table: &crate::table::Table) -> crate::spec::DataFile {
-        DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(100)
-            .record_count(10)
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .partition(Struct::from_iter([Some(Literal::long(100))]))
-            .build()
-            .unwrap()
-    }
-
-    fn pos_delete_v2(path: &str, table: &crate::table::Table) -> crate::spec::DataFile {
-        DataFileBuilder::default()
-            .content(DataContentType::PositionDeletes)
-            .file_path(path.to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(50)
-            .record_count(5)
-            .partition_spec_id(table.metadata().default_partition_spec_id())
-            .partition(Struct::from_iter([Some(Literal::long(100))]))
-            .build()
-            .unwrap()
-    }
+    use crate::{Error, TableUpdate};
 
     fn extract_operation(updates: &[TableUpdate]) -> Operation {
         if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
@@ -476,7 +451,7 @@ mod tests {
         .commit(&base)
         .await
         .unwrap();
-        let table = table_with_snapshot(&base, first_snapshot(first_commit.take_updates())).await;
+        let table = table_with_snapshot(&base, first_snapshot(first_commit.take_updates()));
 
         let result = Arc::new(
             Transaction::new(&table)
@@ -609,33 +584,6 @@ mod tests {
         }
     }
 
-    async fn table_with_snapshot(base: &Table, snapshot: Snapshot) -> Table {
-        let updated =
-            TableMetadataBuilder::new_from_metadata(base.metadata_ref().as_ref().clone(), None)
-                .set_branch_snapshot(snapshot, MAIN_BRANCH)
-                .unwrap()
-                .build()
-                .unwrap()
-                .metadata;
-
-        Table::builder()
-            .metadata(updated)
-            .metadata_location("s3://bucket/test/location/metadata/v2.json".to_string())
-            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(base.file_io().clone())
-            .build()
-            .unwrap()
-    }
-
-    fn first_snapshot(updates: Vec<TableUpdate>) -> Snapshot {
-        for update in updates {
-            if let TableUpdate::AddSnapshot { snapshot } = update {
-                return snapshot;
-            }
-        }
-        panic!("no AddSnapshot in updates");
-    }
-
     #[tokio::test]
     async fn remove_delete_file_rewrites_manifest_and_preserves_sequence_numbers() {
         let base = make_v2_minimal_table();
@@ -655,7 +603,7 @@ mod tests {
         .unwrap();
         let snap_s1 = first_snapshot(commit_s1.take_updates());
         let s1_seq = snap_s1.sequence_number();
-        let table_s1 = table_with_snapshot(&base, snap_s1).await;
+        let table_s1 = table_with_snapshot(&base, snap_s1);
 
         let mut commit_s2 = Arc::new(
             Transaction::new(&table_s1)

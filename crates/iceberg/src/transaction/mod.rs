@@ -284,10 +284,13 @@ mod tests {
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIO;
-    use crate::spec::TableMetadata;
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Snapshot,
+        Struct, TableMetadata, TableMetadataBuilder,
+    };
     use crate::table::Table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
-    use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
+    use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent, TableUpdate};
 
     pub fn make_v1_table() -> Table {
         let file = File::open(format!(
@@ -328,22 +331,76 @@ mod tests {
     }
 
     pub fn make_v2_minimal_table() -> Table {
+        make_minimal_table("TableMetadataV2ValidMinimal.json")
+    }
+
+    pub fn make_v3_minimal_table() -> Table {
+        make_minimal_table("TableMetadataV3ValidMinimal.json")
+    }
+
+    fn make_minimal_table(metadata_file: &str) -> Table {
         let file = File::open(format!(
-            "{}/testdata/table_metadata/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            "TableMetadataV2ValidMinimal.json"
+            "{}/testdata/table_metadata/{metadata_file}",
+            env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
-        let reader = BufReader::new(file);
-        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+        let metadata = serde_json::from_reader::<_, TableMetadata>(BufReader::new(file)).unwrap();
 
         Table::builder()
-            .metadata(resp)
+            .metadata(metadata)
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(FileIO::new_with_memory())
             .build()
             .unwrap()
+    }
+
+    pub fn data_file(path: &str, table: &Table) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .build()
+            .unwrap()
+    }
+
+    pub fn pos_delete_v2(path: &str, table: &Table) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(5)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .build()
+            .unwrap()
+    }
+
+    pub fn first_snapshot(updates: Vec<TableUpdate>) -> Snapshot {
+        updates
+            .into_iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .expect("commit did not add a snapshot")
+    }
+
+    pub fn table_with_snapshot(base: &Table, snapshot: Snapshot) -> Table {
+        let updated =
+            TableMetadataBuilder::new_from_metadata(base.metadata_ref().as_ref().clone(), None)
+                .set_branch_snapshot(snapshot, MAIN_BRANCH)
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata;
+
+        base.clone().with_metadata(Arc::new(updated))
     }
 
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
@@ -356,14 +413,8 @@ mod tests {
             .await
             .unwrap();
 
-        let file = File::open(format!(
-            "{}/testdata/table_metadata/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            "TableMetadataV3ValidMinimal.json"
-        ))
-        .unwrap();
-        let reader = BufReader::new(file);
-        let base_metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+        let base = make_v3_minimal_table();
+        let base_metadata = base.metadata();
 
         let table_creation = TableCreation::builder()
             .schema((**base_metadata.current_schema()).clone())

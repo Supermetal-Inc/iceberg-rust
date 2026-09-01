@@ -16,12 +16,11 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{Sender, channel};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::runtime::spawn;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
@@ -30,13 +29,7 @@ use crate::spec::{DataContentType, DataFile, Struct};
 /// Index of delete files
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileIndex {
-    state: Arc<RwLock<DeleteFileIndexState>>,
-}
-
-#[derive(Debug)]
-enum DeleteFileIndexState {
-    Populating(Arc<Notify>),
-    Populated(PopulatedDeleteFileIndex),
+    state: watch::Receiver<Option<PopulatedDeleteFileIndex>>,
 }
 
 #[derive(Debug)]
@@ -56,29 +49,16 @@ impl DeleteFileIndex {
     pub(crate) fn new() -> (DeleteFileIndex, Sender<DeleteFileContext>) {
         // TODO: what should the channel limit be?
         let (tx, rx) = channel(10);
-        let notify = Arc::new(Notify::new());
-        let state = Arc::new(RwLock::new(DeleteFileIndexState::Populating(
-            notify.clone(),
-        )));
+        let (state_tx, state_rx) = watch::channel(None);
         let delete_file_stream = rx.boxed();
 
-        spawn({
-            let state = state.clone();
-            async move {
-                let delete_files: Vec<DeleteFileContext> =
-                    delete_file_stream.collect::<Vec<_>>().await;
+        spawn(async move {
+            let delete_files: Vec<DeleteFileContext> = delete_file_stream.collect::<Vec<_>>().await;
 
-                let populated_delete_file_index = PopulatedDeleteFileIndex::new(delete_files);
-
-                {
-                    let mut guard = state.write().unwrap();
-                    *guard = DeleteFileIndexState::Populated(populated_delete_file_index);
-                }
-                notify.notify_waiters();
-            }
+            state_tx.send_replace(Some(PopulatedDeleteFileIndex::new(delete_files)));
         });
 
-        (DeleteFileIndex { state }, tx)
+        (DeleteFileIndex { state: state_rx }, tx)
     }
 
     /// Gets all the delete files that apply to the specified data file.
@@ -87,25 +67,15 @@ impl DeleteFileIndex {
         data_file: &DataFile,
         seq_num: Option<i64>,
     ) -> Vec<FileScanTaskDeleteFile> {
-        let notifier = {
-            let guard = self.state.read().unwrap();
-            match *guard {
-                DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
-                DeleteFileIndexState::Populated(ref index) => {
-                    return index.get_deletes_for_data_file(data_file, seq_num);
-                }
-            }
-        };
-
-        notifier.notified().await;
-
-        let guard = self.state.read().unwrap();
-        match guard.deref() {
-            DeleteFileIndexState::Populated(index) => {
-                index.get_deletes_for_data_file(data_file, seq_num)
-            }
-            _ => unreachable!("Cannot be any other state than loaded"),
-        }
+        let mut state = self.state.clone();
+        let populated = state
+            .wait_for(Option::is_some)
+            .await
+            .expect("DeleteFileIndex population task ended before publishing the index; it may have panicked");
+        populated
+            .as_ref()
+            .expect("DeleteFileIndex must be populated after readiness")
+            .get_deletes_for_data_file(data_file, seq_num)
     }
 }
 
@@ -214,6 +184,8 @@ impl PopulatedDeleteFileIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use uuid::Uuid;
 
     use super::*;
@@ -221,6 +193,59 @@ mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
         Struct,
     };
+
+    #[tokio::test]
+    async fn test_delete_file_index_ready_before_lookup() {
+        let (delete_file_index, delete_file_tx) = DeleteFileIndex::new();
+        let mut state = delete_file_index.state.clone();
+        drop(delete_file_tx);
+
+        tokio::time::timeout(Duration::from_secs(1), state.wait_for(Option::is_some))
+            .await
+            .expect("delete file index population timed out")
+            .expect("delete file index population task stopped");
+
+        let deletes = tokio::time::timeout(
+            Duration::from_secs(1),
+            delete_file_index.get_deletes_for_data_file(&build_unpartitioned_data_file(), None),
+        )
+        .await
+        .expect("lookup missed an already-published ready state");
+
+        assert!(deletes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_index_serves_concurrent_lookups() {
+        let (delete_file_index, delete_file_tx) = DeleteFileIndex::new();
+        let data_file = build_unpartitioned_data_file();
+
+        let first_index = delete_file_index.clone();
+        let first_data_file = data_file.clone();
+        let first_waiter = tokio::spawn(async move {
+            first_index
+                .get_deletes_for_data_file(&first_data_file, None)
+                .await
+        });
+        let second_waiter = tokio::spawn(async move {
+            delete_file_index
+                .get_deletes_for_data_file(&data_file, None)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        drop(delete_file_tx);
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(first_waiter, second_waiter)
+        })
+        .await
+        .expect("delete file index waiters timed out")
+        .expect("delete file index waiter stopped");
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
 
     #[test]
     fn test_delete_file_index_unpartitioned() {

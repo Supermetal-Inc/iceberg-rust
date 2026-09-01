@@ -192,6 +192,7 @@ pub(crate) trait SnapshotValidator {
             };
             delete_file_tx.send(delete_file_ctx).await?;
         }
+        drop(delete_file_tx);
 
         // Get starting seq num from starting snapshot if available
         let starting_sequence_number = if let Some(from_snapshot_id) = from_snapshot_id {

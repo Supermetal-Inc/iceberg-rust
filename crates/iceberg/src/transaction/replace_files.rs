@@ -407,12 +407,159 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Overwrite, ReplaceFilesMode, Rewrite};
-    use crate::spec::Operation;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Overwrite, ReplaceFilesAction, ReplaceFilesMode, Rewrite};
+    use crate::spec::{DataFile, Operation};
+    use crate::table::Table;
+    use crate::transaction::tests::{
+        data_file, first_snapshot, make_v2_minimal_table, make_v3_minimal_table, pos_delete_v2,
+        table_with_snapshot,
+    };
+    use crate::transaction::{Transaction, TransactionAction};
+
+    const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn modes_map_to_snapshot_operations() {
         assert_eq!(Rewrite::OPERATION, Operation::Replace);
         assert_eq!(Overwrite::OPERATION, Operation::Overwrite);
+    }
+
+    #[tokio::test]
+    async fn v2_overwrite_validation_completes() {
+        let (table, existing_file) = table_with_existing_data(make_v2_minimal_table()).await;
+        assert_overwrite_validation_completes(&table, existing_file).await;
+    }
+
+    #[tokio::test]
+    async fn v3_overwrite_validation_completes() {
+        let (table, existing_file) = table_with_existing_data(make_v3_minimal_table()).await;
+        assert_overwrite_validation_completes(&table, existing_file).await;
+    }
+
+    #[tokio::test]
+    async fn v2_rewrite_validation_completes() {
+        let (table, existing_file) = table_with_existing_data(make_v2_minimal_table()).await;
+        assert_rewrite_validation_completes(&table, existing_file).await;
+    }
+
+    #[tokio::test]
+    async fn v3_rewrite_validation_completes() {
+        let (table, existing_file) = table_with_existing_data(make_v3_minimal_table()).await;
+        assert_rewrite_validation_completes(&table, existing_file).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_concurrent_positional_delete() {
+        assert_rejects_concurrent_positional_delete(
+            false,
+            "Cannot commit, found new delete for added data file",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_concurrent_positional_delete_with_data_sequence_number() {
+        assert_rejects_concurrent_positional_delete(
+            true,
+            "Cannot commit, found new positional delete for added data file",
+        )
+        .await;
+    }
+
+    async fn assert_rejects_concurrent_positional_delete(
+        set_data_sequence_number: bool,
+        expected_message: &str,
+    ) {
+        let (table_s1, existing_file) = table_with_existing_data(make_v2_minimal_table()).await;
+        let starting_snapshot = table_s1.metadata().current_snapshot().unwrap();
+        let starting_snapshot_id = starting_snapshot.snapshot_id();
+        let starting_sequence_number = starting_snapshot.sequence_number();
+        let concurrent_delete = pos_delete_v2("test/concurrent-delete.parquet", &table_s1);
+        let mut concurrent_commit = Arc::new(
+            Transaction::new(&table_s1)
+                .row_delta()
+                .add_delete_files([concurrent_delete]),
+        )
+        .commit(&table_s1)
+        .await
+        .unwrap();
+        let table_s2 =
+            table_with_snapshot(&table_s1, first_snapshot(concurrent_commit.take_updates()));
+        let action = ReplaceFilesAction::<Overwrite>::new()
+            .set_starting_snapshot_id(starting_snapshot_id)
+            .set_snapshot_properties(truncate_snapshot_properties(&table_s2))
+            .delete_data_files([existing_file])
+            .unwrap()
+            .full_table_overwrite();
+        let action = if set_data_sequence_number {
+            action.set_data_sequence_number(starting_sequence_number)
+        } else {
+            action
+        };
+
+        let result = tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(&table_s2))
+            .await
+            .expect("concurrent delete validation timed out");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected concurrent positional delete to be rejected"),
+        };
+        assert!(error.to_string().contains(expected_message), "{error}");
+    }
+
+    async fn assert_overwrite_validation_completes(table: &Table, existing_file: DataFile) {
+        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let action = ReplaceFilesAction::<Overwrite>::new()
+            .set_starting_snapshot_id(starting_snapshot_id)
+            .set_snapshot_properties(truncate_snapshot_properties(table))
+            .delete_data_files([existing_file])
+            .unwrap()
+            .full_table_overwrite();
+
+        tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(table))
+            .await
+            .expect("overwrite validation timed out")
+            .expect("overwrite commit failed");
+    }
+
+    async fn assert_rewrite_validation_completes(table: &Table, existing_file: DataFile) {
+        let replacement = data_file("test/rewrite-replacement.parquet", table);
+        let action = ReplaceFilesAction::<Rewrite>::new()
+            .delete_data_files([existing_file])
+            .unwrap()
+            .add_data_files([replacement])
+            .unwrap();
+
+        tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(table))
+            .await
+            .expect("rewrite validation timed out")
+            .expect("rewrite commit failed");
+    }
+
+    fn truncate_snapshot_properties(table: &Table) -> HashMap<String, String> {
+        HashMap::from([(
+            "sm.truncated_from_snapshot".to_string(),
+            table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id()
+                .to_string(),
+        )])
+    }
+
+    async fn table_with_existing_data(base: Table) -> (Table, DataFile) {
+        let existing_file = data_file("test/existing.parquet", &base);
+        let action = Transaction::new(&base)
+            .fast_append()
+            .add_data_files([existing_file.clone()]);
+        let mut commit = Arc::new(action).commit(&base).await.unwrap();
+        let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
+
+        (table, existing_file)
     }
 }
