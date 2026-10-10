@@ -325,3 +325,35 @@ async fn test_iceberg_schema_preserves_existing_kv_metadata() -> anyhow::Result<
 
     Ok(())
 }
+
+/// Verify that the `iceberg.schema` JSON is embedded in the Arrow schema
+/// metadata (the `ARROW:schema` IPC section), not just the Parquet footer
+/// key-value metadata.  Downstream readers such as Snowflake resolve the
+/// Iceberg schema from this location.
+#[tokio::test]
+async fn test_iceberg_schema_in_arrow_schema_metadata() -> anyhow::Result<()> {
+    let (data_file, file_io, _temp_dir) =
+        write_simple_parquet_file(WriterProperties::builder().build()).await?;
+
+    let input_file = file_io.new_input(data_file.file_path()).unwrap();
+    let input_content = input_file.read().await.unwrap();
+    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(input_content).unwrap();
+
+    // `.schema()` returns the Arrow schema decoded from the ARROW:schema
+    // IPC metadata in the Parquet file.
+    let arrow_schema = reader_builder.schema();
+    let schema_json = arrow_schema
+        .metadata()
+        .get(ICEBERG_SCHEMA_KEY)
+        .expect("Arrow schema metadata must contain 'iceberg.schema' key");
+
+    // Deserialize and verify basic roundtrip
+    let deserialized: Schema = serde_json::from_str(schema_json)
+        .expect("iceberg.schema JSON in Arrow metadata should be valid");
+    assert_eq!(deserialized.schema_id(), 1);
+    assert_eq!(deserialized.as_struct().fields().len(), 2);
+    assert_eq!(deserialized.field_by_id(0).expect("field 0").name, "id");
+    assert_eq!(deserialized.field_by_id(1).expect("field 1").name, "name");
+
+    Ok(())
+}

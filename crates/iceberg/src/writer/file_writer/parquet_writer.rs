@@ -651,7 +651,19 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = Arc::new(self.schema.as_ref().try_into()?);
+            let arrow_schema: ArrowSchemaRef = {
+                let mut schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+                // Embed the Iceberg schema JSON in the Arrow schema metadata so it
+                // is written into the Parquet `ARROW:schema` IPC section. Some
+                // downstream readers (e.g. Snowflake) expect the `iceberg.schema`
+                // key here in addition to the Parquet footer key-value metadata.
+                let iceberg_schema_json = serde_json::to_string(self.schema.as_ref())
+                    .expect("Iceberg schema serialization should not fail");
+                schema
+                    .metadata
+                    .insert(ICEBERG_SCHEMA_KEY.to_string(), iceberg_schema_json);
+                Arc::new(schema)
+            };
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
