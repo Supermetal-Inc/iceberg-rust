@@ -205,6 +205,31 @@ impl Transaction {
         .1
     }
 
+    /// Build and submit this transaction once using its original table metadata.
+    ///
+    /// Unlike [`Transaction::commit`], this method does not reload the table,
+    /// rebase the transaction, or retry a failed catalog update. A concurrent
+    /// catalog update therefore returns directly to the caller, which can
+    /// rebuild the transaction against fresh table metadata before retrying.
+    ///
+    /// Like [`Transaction::commit`], returns `ErrorKind::PreconditionFailed` if the table is
+    /// read-only, even when the transaction has no actions.
+    pub async fn commit_once(mut self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.table.readonly() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Cannot modify a read-only table",
+            )
+            .with_context("table", self.table.identifier().to_string()));
+        }
+
+        if self.actions.is_empty() {
+            return Ok(self.table);
+        }
+
+        self.commit_current(catalog).await
+    }
+
     fn build_backoff(props: TableProperties<'_>) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
             .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms()?))
@@ -227,6 +252,11 @@ impl Transaction {
             self.table = refreshed.clone();
         }
 
+        self.commit_current(catalog).await
+    }
+
+    /// Applies the actions to the current table and submits the result once.
+    async fn commit_current(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
@@ -496,6 +526,44 @@ mod tests {
 
         // Verify the result
         assert!(result.is_ok(), "Transaction should eventually succeed");
+    }
+
+    #[tokio::test]
+    async fn test_commit_once_readonly_table_fails() {
+        let table = make_v2_minimal_readonly_table().await;
+        let catalog = MockCatalog::new();
+
+        for tx in [Transaction::new(&table), create_test_transaction(&table)] {
+            let err = tx.commit_once(&catalog).await.unwrap_err();
+
+            assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+            assert_eq!(err.message(), "Cannot modify a read-only table");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_once_does_not_reload_or_retry() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+        let mut mock_catalog = MockCatalog::new();
+
+        mock_catalog.expect_load_table().times(0);
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async {
+                    Err(
+                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                            .with_retryable(true),
+                    )
+                })
+            });
+
+        let error = tx.commit_once(&mock_catalog).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
     }
 
     #[tokio::test]
