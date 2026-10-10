@@ -17,14 +17,18 @@
 
 //! Test helpers for the fork's transaction actions, kept out of upstream's test module.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::Arc;
 
-use crate::TableUpdate;
+use crate::io::FileIO;
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Snapshot,
-    Struct, TableMetadataBuilder,
+    Struct, TableMetadata, TableMetadataBuilder,
 };
 use crate::table::Table;
+use crate::test_utils::test_runtime;
+use crate::{TableIdent, TableUpdate};
 
 pub(crate) fn data_file(path: &str, table: &Table) -> DataFile {
     DataFileBuilder::default()
@@ -72,4 +76,24 @@ pub(crate) fn table_with_snapshot(base: &Table, snapshot: Snapshot) -> Table {
             .metadata;
 
     base.clone().with_metadata(Arc::new(updated))
+}
+
+pub(crate) fn make_v3_minimal_table() -> Table {
+    let file = File::open(format!(
+        "{}/testdata/table_metadata/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        "TableMetadataV3ValidMinimal.json"
+    ))
+    .unwrap();
+    let reader = BufReader::new(file);
+    let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+    Table::builder()
+        .metadata(resp)
+        .metadata_location("s3://bucket/test/location/metadata/v1.json")
+        .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+        .file_io(FileIO::new_with_memory())
+        .runtime(test_runtime())
+        .build()
+        .unwrap()
 }

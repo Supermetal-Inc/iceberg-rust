@@ -57,6 +57,7 @@ mod append;
 mod expire_snapshots;
 #[cfg(test)]
 mod fork_test_utils;
+mod overwrite_files;
 mod row_delta;
 mod snapshot;
 mod sort_order;
@@ -79,6 +80,7 @@ use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::overwrite_files::OverwriteFilesAction;
 pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
@@ -148,6 +150,11 @@ impl Transaction {
     /// Creates an update schema action.
     pub fn update_schema(&self) -> UpdateSchemaAction {
         UpdateSchemaAction::new()
+    }
+
+    /// Overwrite a set of data files of table.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
     }
 
     /// Row delta. Adds data files and delete files, and optionally marks
