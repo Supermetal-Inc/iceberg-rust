@@ -26,7 +26,7 @@ mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,8 +36,8 @@ use cfg_if::cfg_if;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
-    StorageFactory,
+    FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, InputFile, OutputFile, Storage,
+    StorageConfig, StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_property_macro::Properties;
@@ -132,12 +132,18 @@ pub struct OpenDalClientConfig {
         parse_with = parse_io_timeout_ms
     )]
     io_timeout_ms: NonZeroU64,
+    /// Size in bytes of each part a writer sends, from [`IO_CHUNK_SIZE`]. Without it, OpenDAL
+    /// turns each buffer handed to the writer into one request, so a large parquet row group
+    /// becomes a single oversized multipart upload part.
+    #[property(key = IO_CHUNK_SIZE, default = None)]
+    write_chunk_size: Option<NonZeroUsize>,
 }
 
 impl Default for OpenDalClientConfig {
     fn default() -> Self {
         Self {
             io_timeout_ms: DEFAULT_IO_TIMEOUT_MS,
+            write_chunk_size: None,
         }
     }
 }
@@ -145,6 +151,10 @@ impl Default for OpenDalClientConfig {
 impl OpenDalClientConfig {
     pub(crate) fn io_timeout(&self) -> Duration {
         Duration::from_millis(self.io_timeout_ms.get())
+    }
+
+    pub(crate) fn write_chunk_size(&self) -> Option<usize> {
+        self.write_chunk_size.map(NonZeroUsize::get)
     }
 }
 
@@ -710,8 +720,12 @@ impl Storage for OpenDalStorage {
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let (op, relative_path) = self.create_operator(&path)?;
+        let writer = match self.client_config().write_chunk_size() {
+            Some(chunk_size) => op.writer_with(relative_path).chunk(chunk_size).await,
+            None => op.writer(relative_path).await,
+        };
         Ok(Box::new(OpenDalWriter::new(
-            op.writer(relative_path).await.map_err(from_opendal_error)?,
+            writer.map_err(from_opendal_error)?,
         )))
     }
 
