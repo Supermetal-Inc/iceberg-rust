@@ -20,6 +20,7 @@
 //! Parquet with a reader of its own can still decode the vectors Iceberg
 //! writes.
 
+use std::collections::HashMap;
 use std::ops::BitOrAssign;
 
 use bytes::Buf;
@@ -28,6 +29,8 @@ use roaring::treemap::BitmapIter;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::error::invalid_data;
+use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
 
 /// Magic bytes prefixing a serialized `deletion-vector-v1` bitmap, per the Iceberg Puffin spec.
@@ -37,6 +40,11 @@ const DV_LENGTH_PREFIX_BYTES: usize = 4;
 const DV_MAGIC_BYTES: usize = 4;
 const DV_CRC_BYTES: usize = 4;
 const DV_MIN_BLOB_BYTES: usize = DV_LENGTH_PREFIX_BYTES + DV_MAGIC_BYTES + DV_CRC_BYTES;
+
+/// Puffin blob property holding the number of deleted positions in a deletion vector.
+pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
+/// Puffin blob property holding the path of the data file a deletion vector applies to.
+pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
 /// The deleted row positions of one data file: a set of 64-bit positions,
 /// kept as a [`RoaringTreemap`].
@@ -104,6 +112,61 @@ impl DeleteVector {
             bitmap_iter: None,
             buffered: None,
         }
+    }
+
+    /// Serializes this `DeleteVector` into a `deletion-vector-v1` Puffin blob that
+    /// [`DeleteVector::deserialize`] reads back:
+    ///
+    /// ```text
+    /// [length: u32 big-endian][magic: D1 D3 39 64][vector][crc: u32 big-endian]
+    /// ```
+    ///
+    /// `vector` is the roaring bitmap in the portable 64-bit format written by
+    /// `RoaringTreemap::serialize_into`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::DataInvalid`] if the magic and vector would exceed the `u32`
+    /// length prefix.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let mut vector = Vec::with_capacity(self.inner.serialized_size());
+        self.inner.serialize_into(&mut vector).map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "failed to serialize roaring treemap").with_source(e)
+        })?;
+        if u32::try_from(DV_MAGIC_BYTES + vector.len()).is_err() {
+            return Err(invalid_data!(
+                "deletion-vector-v1 body length exceeds u32::MAX"
+            ));
+        }
+        Ok(frame_dv_blob(&vector))
+    }
+
+    /// Builds the `deletion-vector-v1` Puffin [`Blob`] for this vector.
+    ///
+    /// `properties` must include `cardinality` and `referenced-data-file`. As the spec
+    /// requires for deletion vectors, the snapshot id and sequence number are -1; they are
+    /// inherited from the manifest entry. Like Java's `BaseDVFileWriter`, the blob is
+    /// computed for the row position metadata column.
+    pub(crate) fn to_puffin_blob(&self, properties: HashMap<String, String>) -> Result<Blob> {
+        for key in [
+            DELETION_VECTOR_PROPERTY_CARDINALITY,
+            DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
+        ] {
+            if !properties.contains_key(key) {
+                return Err(invalid_data!(
+                    "deletion vector properties must include {key}"
+                ));
+            }
+        }
+
+        Ok(Blob::builder()
+            .r#type(DELETION_VECTOR_V1.to_string())
+            .fields(vec![RESERVED_FIELD_ID_POS])
+            .snapshot_id(-1)
+            .sequence_number(-1)
+            .data(self.serialize()?)
+            .properties(properties)
+            .build())
     }
 
     /// Parses a `deletion-vector-v1` Puffin blob into a `DeleteVector`.
@@ -444,11 +507,9 @@ impl BitOrAssign for DeleteVector {
     }
 }
 
-// Reproduces Iceberg-Java's `deletion-vector-v1` framing so tests can round-trip through
-// `deserialize` without a Java writer, and so other test modules can build blob fixtures.
-// Cross-implementation golden fixtures produced by Iceberg-Java are tracked separately; this
-// only checks that our decode matches our encode.
-#[cfg(test)]
+// Reproduces Iceberg-Java's `deletion-vector-v1` framing. `serialize` uses it to write
+// deletion vectors, and tests use it to build blob fixtures from raw roaring directories.
+// Callers must keep the magic plus `vector` within `u32::MAX` bytes.
 pub(crate) fn frame_dv_blob(vector: &[u8]) -> Vec<u8> {
     let body_len = DV_MAGIC_BYTES + vector.len();
     let mut blob = Vec::with_capacity(DV_LENGTH_PREFIX_BYTES + body_len + DV_CRC_BYTES);
