@@ -25,11 +25,12 @@ mod sigv4;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 #[cfg(feature = "sigv4")]
 pub use aws_credential_types::Credentials;
-use iceberg::{Result, SessionContext};
+use iceberg::{Error, ErrorKind, Result, SessionContext};
 pub use oauth2::OAuth2Manager;
 #[cfg(feature = "sigv4")]
 pub use sigv4::{PayloadHashMode, SigV4Signer};
@@ -115,6 +116,28 @@ pub trait AuthManager: Debug + Send + Sync {
 pub trait AuthSession: Debug + Send + Sync {
     /// Applies authentication to the request (adds headers, signs, ...).
     async fn authenticate(&self, request: &mut HttpRequest) -> Result<()>;
+
+    /// Replaces the session's credentials with newly issued ones, e.g. by
+    /// exchanging the OAuth2 client credential for a new token.
+    ///
+    /// Requests keep using the current credentials until the new ones are in
+    /// place, and if obtaining new ones fails the current ones are kept.
+    ///
+    /// The default implementation returns [`ErrorKind::FeatureUnsupported`].
+    async fn refresh(&self) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "This authentication session cannot refresh its credentials",
+        ))
+    }
+
+    /// The local deadline at which the session's current credentials expire,
+    /// or `None` when there are none or their lifetime is unknown.
+    ///
+    /// The default implementation returns `None`.
+    async fn expires_at(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// [`AuthManager`] that performs no authentication.

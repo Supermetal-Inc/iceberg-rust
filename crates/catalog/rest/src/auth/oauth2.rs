@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use http::StatusCode;
@@ -49,7 +50,7 @@ struct OAuth2Params {
 /// for a token at the token endpoint and cached. The cached token is shared
 /// across sessions so it survives the config handshake.
 pub struct OAuth2Manager {
-    token: Arc<Mutex<Option<SensitiveString>>>,
+    token: Arc<Mutex<Option<CachedToken>>>,
     init_params: OAuth2Params,
     /// True when the token endpoint was derived from the catalog URI (not
     /// explicitly configured): it is then recomputed from the merged URI in
@@ -81,7 +82,9 @@ impl OAuth2Manager {
 
     /// Sets a bearer token used directly (takes precedence over `credential`).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token = Arc::new(Mutex::new(Some(SensitiveString::from(token.into()))));
+        self.token = Arc::new(Mutex::new(Some(CachedToken::static_token(
+            SensitiveString::from(token.into()),
+        ))));
         self
     }
 
@@ -107,7 +110,11 @@ impl OAuth2Manager {
 
     pub(crate) fn from_config(cfg: &RestCatalogConfig) -> Result<Self> {
         Ok(Self {
-            token: Arc::new(Mutex::new(cfg.token().map(SensitiveString::from))),
+            token: Arc::new(Mutex::new(
+                cfg.token()
+                    .map(SensitiveString::from)
+                    .map(CachedToken::static_token),
+            )),
             init_params: OAuth2Params {
                 extra_headers: cfg.extra_headers()?,
                 token_endpoint: cfg.get_token_endpoint(),
@@ -158,7 +165,9 @@ impl OAuth2Manager {
     ) -> Result<OAuth2Session> {
         // The properties may carry a new token (or restate the user's).
         if let Some(token) = props.get("token") {
-            *self.token.lock().await = Some(SensitiveString::from(token.clone()));
+            *self.token.lock().await = Some(CachedToken::static_token(SensitiveString::from(
+                token.clone(),
+            )));
         }
 
         let mut extra_headers = self.init_params.extra_headers.clone();
@@ -231,8 +240,36 @@ fn attach_bearer(req: &mut HttpRequest, token: &SensitiveString) -> Result<()> {
 /// exchanged for the credential on demand.
 ///
 /// # TODO: Support automatic token refreshing.
+/// A token held by the manager and its sessions.
+struct CachedToken {
+    value: SensitiveString,
+    /// Local deadline derived from the token response's `expires_in`; `None` for a configured
+    /// token or when the server reports no lifetime.
+    expires_at: Option<Instant>,
+}
+
+impl CachedToken {
+    fn static_token(value: SensitiveString) -> Self {
+        Self {
+            value,
+            expires_at: None,
+        }
+    }
+
+    /// `requested_at` is when the token request was sent, so network latency shortens,
+    /// rather than extends, the token's local lifetime.
+    fn from_response(response: TokenResponse, requested_at: Instant) -> Self {
+        Self {
+            value: SensitiveString::from(response.access_token),
+            expires_at: response
+                .expires_in
+                .and_then(|seconds| requested_at.checked_add(Duration::from_secs(seconds))),
+        }
+    }
+}
+
 struct OAuth2Session {
-    token: Arc<Mutex<Option<SensitiveString>>>,
+    token: Arc<Mutex<Option<CachedToken>>>,
     token_source: TokenSource,
 }
 
@@ -264,7 +301,7 @@ impl Debug for OAuth2Session {
 }
 
 impl ClientCredentialsConfig {
-    async fn exchange_credential_for_token(&self) -> Result<String> {
+    async fn exchange_credential_for_token(&self) -> Result<CachedToken> {
         let (client_id, client_secret) = &self.credential;
 
         let mut params = HashMap::with_capacity(4);
@@ -279,6 +316,7 @@ impl ClientCredentialsConfig {
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
 
+        let requested_at = Instant::now();
         let response = self
             .client
             .post_form(&self.token_endpoint, &self.extra_headers, &params)
@@ -308,7 +346,7 @@ impl ClientCredentialsConfig {
             })?;
             Err(Error::from(e))
         }?;
-        Ok(auth_res.access_token)
+        Ok(CachedToken::from_response(auth_res, requested_at))
     }
 }
 
@@ -323,13 +361,13 @@ impl AuthSession for OAuth2Session {
         let token = {
             let mut token = self.token.lock().await;
             match (&*token, &self.token_source) {
-                (Some(token), _) => Some(token.clone()),
+                (Some(token), _) => Some(token.value.clone()),
                 (None, TokenSource::StaticToken) => None,
                 (None, TokenSource::ClientCredentials(config)) => {
-                    let new_token =
-                        SensitiveString::from(config.exchange_credential_for_token().await?);
-                    *token = Some(new_token.clone());
-                    Some(new_token)
+                    let new_token = config.exchange_credential_for_token().await?;
+                    let value = new_token.value.clone();
+                    *token = Some(new_token);
+                    Some(value)
                 }
             }
         };
@@ -338,6 +376,29 @@ impl AuthSession for OAuth2Session {
             Some(token) => attach_bearer(req, &token),
             None => Ok(()),
         }
+    }
+
+    /// Exchanges the credential for a new token and replaces the cached one.
+    /// The cached token stays in use during the exchange, and is kept if the
+    /// exchange fails.
+    async fn refresh(&self) -> Result<()> {
+        let TokenSource::ClientCredentials(config) = &self.token_source else {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Credential must be provided for authentication",
+            ));
+        };
+        let new_token = config.exchange_credential_for_token().await?;
+        *self.token.lock().await = Some(new_token);
+        Ok(())
+    }
+
+    async fn expires_at(&self) -> Option<Instant> {
+        self.token
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|token| token.expires_at)
     }
 }
 

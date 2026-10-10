@@ -23,7 +23,7 @@ use std::future::Future;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
@@ -706,6 +706,16 @@ impl RestCatalog {
         }
     }
 
+    /// See [`RestSessionCatalog::regenerate_token`].
+    pub async fn regenerate_token(&self) -> Result<()> {
+        self.inner.regenerate_token().await
+    }
+
+    /// See [`RestSessionCatalog::token_expires_at`].
+    pub async fn token_expires_at(&self) -> Result<Option<Instant>> {
+        self.inner.token_expires_at().await
+    }
+
     #[cfg(test)]
     async fn client(&self) -> Result<&RestCatalogClient> {
         self.inner.client().await
@@ -953,6 +963,25 @@ impl RestSessionCatalog {
                 RestCatalogClient::init(&self.user_config, self.resolve_auth_manager()?).await
             })
             .await
+    }
+
+    /// Replaces the catalog session's token with a new one. The new token is
+    /// obtained before the current one is replaced, so requests keep using the
+    /// current token until then.
+    ///
+    /// If the credential is invalid, or the request fails, this method returns
+    /// an error and leaves the current token unchanged. Sessions that cannot
+    /// refresh, e.g. a configured token without a credential, return an error.
+    pub async fn regenerate_token(&self) -> Result<()> {
+        self.client().await?.catalog_session.refresh().await
+    }
+
+    /// Returns the local monotonic deadline derived from the OAuth
+    /// `expires_in` of the catalog session's token.
+    ///
+    /// Returns `None` when the cached token has no reported lifetime.
+    pub async fn token_expires_at(&self) -> Result<Option<Instant>> {
+        Ok(self.client().await?.catalog_session.expires_at().await)
     }
 
     /// Returns whether the server supports `endpoint`, per the `endpoints` it
