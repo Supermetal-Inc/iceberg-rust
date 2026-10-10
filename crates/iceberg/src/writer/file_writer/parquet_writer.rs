@@ -204,6 +204,20 @@ impl IndexByParquetPathName {
     pub fn get(&self, name: &str) -> Option<&i32> {
         self.name_to_id.get(name)
     }
+
+    fn insert_current_path(&mut self) -> Result<()> {
+        let full_name = self.field_names.iter().map(String::as_str).join(".");
+        let field_id = self.field_id;
+        if let Some(existing_field_id) = self.name_to_id.get(full_name.as_str()) {
+            return Err(invalid_data!(
+                "Invalid schema: multiple fields for name {full_name}: {field_id} and {existing_field_id}"
+            ));
+        } else {
+            self.name_to_id.insert(full_name, field_id);
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for IndexByParquetPathName {
@@ -282,24 +296,11 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 
     fn primitive(&mut self, _p: &PrimitiveType) -> Result<Self::T> {
-        let full_name = self.field_names.iter().map(String::as_str).join(".");
-        let field_id = self.field_id;
-        if let Some(existing_field_id) = self.name_to_id.get(full_name.as_str()) {
-            return Err(invalid_data!(
-                "Invalid schema: multiple fields for name {full_name}: {field_id} and {existing_field_id}"
-            ));
-        } else {
-            self.name_to_id.insert(full_name, field_id);
-        }
-
-        Ok(())
+        self.insert_current_path()
     }
 
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Writing variant columns to Parquet is not supported yet",
-        ))
+        self.insert_current_path()
     }
 }
 
@@ -936,18 +937,22 @@ mod tests {
     }
 
     #[test]
-    fn test_index_by_parquet_path_variant_is_unsupported() {
-        // Writing variant columns to Parquet is not supported yet; indexing a schema that
-        // contains one must error rather than silently miss-map columns.
+    fn test_index_by_parquet_path_variant() {
+        // A variant column is indexed by its own path. Its `metadata` and `value` leaf
+        // columns are not, so they are skipped when collecting column metrics.
         let schema = Schema::builder()
             .with_fields(vec![
-                NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
             ])
             .build()
             .unwrap();
         let mut visitor = IndexByParquetPathName::new();
-        let err = visit_schema(&schema, &mut visitor).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported, "{err}");
+        visit_schema(&schema, &mut visitor).unwrap();
+        assert_eq!(
+            visitor.name_to_id,
+            HashMap::from([("id".to_string(), 1), ("v".to_string(), 2)])
+        );
     }
 
     #[tokio::test]
