@@ -20,7 +20,9 @@
 use std::marker::PhantomData;
 
 use crate::Result;
-use crate::writer::{DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder};
+use crate::writer::{
+    CurrentFileStatus, DefaultInput, DefaultOutput, IcebergWriter, IcebergWriterBuilder,
+};
 
 /// A simple wrapper around `IcebergWriterBuilder` for unpartitioned tables.
 ///
@@ -99,6 +101,35 @@ where
             self.output.extend(writer.close().await?);
         }
         Ok(O::from_iter(self.output))
+    }
+}
+
+/// Reports the status of the current file. Before the first write there is no file yet:
+/// the path is empty and the row count and written size are 0.
+impl<B, I, O> CurrentFileStatus for UnpartitionedWriter<B, I, O>
+where
+    B: IcebergWriterBuilder<I, O>,
+    B::R: CurrentFileStatus,
+    O: IntoIterator + FromIterator<<O as IntoIterator>::Item>,
+    <O as IntoIterator>::Item: Clone,
+{
+    fn current_file_path(&self) -> String {
+        self.writer
+            .as_ref()
+            .map(CurrentFileStatus::current_file_path)
+            .unwrap_or_default()
+    }
+
+    fn current_row_num(&self) -> usize {
+        self.writer
+            .as_ref()
+            .map_or(0, CurrentFileStatus::current_row_num)
+    }
+
+    fn current_written_size(&self) -> usize {
+        self.writer
+            .as_ref()
+            .map_or(0, CurrentFileStatus::current_written_size)
     }
 }
 

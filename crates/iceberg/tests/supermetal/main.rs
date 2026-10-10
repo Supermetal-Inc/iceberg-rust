@@ -22,3 +22,4 @@ mod iceberg_schema;
 mod utc;
 mod variant;
 mod variant_equality_delete;
+mod written_size;
