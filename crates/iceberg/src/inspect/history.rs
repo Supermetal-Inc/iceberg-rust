@@ -152,12 +152,12 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "made_current_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
             expect![[r#"
-                made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                made_current_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2018-01-04T21:22:35.770+00:00,
                   2019-04-12T20:29:15.770+00:00,
@@ -255,12 +255,12 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "made_current_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
             expect![[r#"
-                made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                made_current_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2017-07-14T02:40:00+00:00,
                   2018-01-04T21:22:35.770+00:00,
@@ -355,12 +355,12 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "made_current_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
             expect![[r#"
-                made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                made_current_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2018-01-04T21:22:35.770+00:00,
                   2019-04-12T20:29:15.770+00:00,
@@ -429,12 +429,12 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "made_current_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
             expect![[r#"
-                made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                made_current_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                 ],
                 snapshot_id: PrimitiveArray<Int64>
@@ -507,12 +507,12 @@ mod tests {
         check_record_batches(
             batch_stream.try_collect::<Vec<_>>().await.unwrap(),
             expect![[r#"
-                Field { "made_current_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
+                Field { "made_current_at": Timestamp(µs, "UTC"), metadata: {"PARQUET:field_id": "1"} },
                 Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
                 Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
                 Field { "is_current_ancestor": Boolean, metadata: {"PARQUET:field_id": "4"} }"#]],
             expect![[r#"
-                made_current_at: PrimitiveArray<Timestamp(µs, "+00:00")>
+                made_current_at: PrimitiveArray<Timestamp(µs, "UTC")>
                 [
                   2018-01-04T21:22:35.770+00:00,
                   2019-04-12T20:29:15.770+00:00,

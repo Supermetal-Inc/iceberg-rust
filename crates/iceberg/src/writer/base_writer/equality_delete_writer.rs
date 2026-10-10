@@ -723,7 +723,7 @@ mod test {
         ])) as ArrayRef;
         let col7 = Arc::new(
             arrow_array::TimestampMicrosecondArray::from(vec![Some(0), Some(1), Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(crate::arrow::UTC_TIME_ZONE),
         ) as ArrayRef;
         let col8 = Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
             Some(0),
@@ -732,7 +732,7 @@ mod test {
         ])) as ArrayRef;
         let col9 = Arc::new(
             arrow_array::TimestampNanosecondArray::from(vec![Some(0), Some(1), Some(3)])
-                .with_timezone_utc(),
+                .with_timezone(crate::arrow::UTC_TIME_ZONE),
         ) as ArrayRef;
         let col10 = Arc::new(arrow_array::StringArray::from(vec![
             Some("a"),
