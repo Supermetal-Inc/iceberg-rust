@@ -55,6 +55,9 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+#[cfg(test)]
+mod fork_test_utils;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -76,6 +79,7 @@ use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -144,6 +148,12 @@ impl Transaction {
     /// Creates an update schema action.
     pub fn update_schema(&self) -> UpdateSchemaAction {
         UpdateSchemaAction::new()
+    }
+
+    /// Row delta. Adds data files and delete files, and optionally marks
+    /// prior delete files as DELETED in the same snapshot.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
     }
 
     /// Creates a fast append action.

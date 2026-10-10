@@ -95,6 +95,146 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync + SnapshotValidator {
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
+/// Checks that `files` are position or equality delete files, and that equality delete files
+/// name their equality fields. `label` describes the files in error messages.
+pub(crate) fn validate_delete_files(files: &[DataFile], label: &str) -> Result<()> {
+    for file in files {
+        match file.content_type() {
+            DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {}
+            DataContentType::Data => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "{label} file {} has content type Data; use add_data_files",
+                        file.file_path()
+                    ),
+                ));
+            }
+        }
+        if file.content_type() == DataContentType::EqualityDeletes
+            && file.equality_ids().is_none_or(|ids| ids.is_empty())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("equality delete {} missing equality_ids", file.file_path()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a delete file can be added to a table of `format_version`: v1 has no delete
+/// files, v2 position deletes cannot be deletion vectors, and v3 position deletes must be.
+fn validate_delete_file_format(file: &DataFile, format_version: FormatVersion) -> Result<()> {
+    if format_version == FormatVersion::V1 {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "delete files are not supported in V1",
+        ));
+    }
+    if file.content_type() != DataContentType::PositionDeletes {
+        return Ok(());
+    }
+    let is_dv = file.file_format() == DataFileFormat::Puffin;
+    match (format_version, is_dv) {
+        (FormatVersion::V2, true) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "V2 forbids deletion vectors for position deletes: {}",
+                file.file_path()
+            ),
+        )),
+        (FormatVersion::V3, false) => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "V3 requires deletion vectors for position deletes: {}",
+                file.file_path()
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Identifies the manifest entries of the files a commit removes.
+///
+/// Data files and delete files are identified by path, except that a Puffin file can hold the
+/// deletion vectors of several data files. A removed delete file that carries a content offset
+/// is matched by path and offset, and one that carries a referenced data file by path and
+/// referenced data file, as Java's `DeleteFileSet` does. One that carries neither matches every
+/// live entry at its path, so it is rejected by [`Self::check_unambiguous`] when that is more
+/// than one.
+pub(crate) struct RemovedFiles<'a> {
+    data_paths: HashSet<&'a str>,
+    delete_paths: HashSet<&'a str>,
+    delete_offsets: HashSet<(&'a str, i64)>,
+    delete_references: HashSet<(&'a str, &'a str)>,
+}
+
+impl<'a> RemovedFiles<'a> {
+    fn new(data_files: &'a [DataFile], delete_files: &'a [DataFile]) -> Self {
+        let mut removed = Self {
+            data_paths: data_files.iter().map(|f| f.file_path()).collect(),
+            delete_paths: HashSet::new(),
+            delete_offsets: HashSet::new(),
+            delete_references: HashSet::new(),
+        };
+        for file in delete_files {
+            let path = file.file_path();
+            if let Some(offset) = file.content_offset {
+                removed.delete_offsets.insert((path, offset));
+            } else if let Some(reference) = file.referenced_data_file.as_deref() {
+                removed.delete_references.insert((path, reference));
+            } else {
+                removed.delete_paths.insert(path);
+            }
+        }
+        removed
+    }
+
+    /// Whether `entry` is one of the removed files. Does not look at the entry's status.
+    pub(crate) fn contains(&self, entry: &ManifestEntry) -> bool {
+        let file = entry.data_file();
+        let path = file.file_path();
+        match file.content_type() {
+            DataContentType::Data => self.data_paths.contains(path),
+            DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
+                self.delete_paths.contains(path)
+                    || file
+                        .content_offset
+                        .is_some_and(|offset| self.delete_offsets.contains(&(path, offset)))
+                    || file
+                        .referenced_data_file
+                        .as_deref()
+                        .is_some_and(|reference| {
+                            self.delete_references.contains(&(path, reference))
+                        })
+            }
+        }
+    }
+
+    /// Fails when a removed delete file identified only by path matched more than one of the
+    /// live `entries`, for example a Puffin file holding several deletion vectors: removing all
+    /// of them would drop deletes for data files the caller did not mean to touch.
+    pub(crate) fn check_unambiguous(&self, entries: &[ManifestEntry]) -> Result<()> {
+        let mut matches: HashMap<&str, usize> = HashMap::new();
+        for entry in entries {
+            let file = entry.data_file();
+            if file.content_type() != DataContentType::Data
+                && self.delete_paths.contains(file.file_path())
+            {
+                *matches.entry(file.file_path()).or_default() += 1;
+            }
+        }
+        match matches.into_iter().find(|(_, count)| *count > 1) {
+            Some((path, count)) => Err(invalid_data!(
+                "Removing delete file {path} is ambiguous: it holds {count} live delete files; \
+                 identify the one to remove by content offset or referenced data file"
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Fits `file`'s column bounds to the types `schema` gives their columns, since a manifest
 /// encodes every bound with the type its schema declares. A bound of an older type is
 /// promoted along Iceberg's type promotions; one that cannot be, such as a long bound under
@@ -217,6 +357,28 @@ impl<'a> SnapshotProducer<'a> {
             }
         }
         self.validate_added_file_partitions(&self.added_data_files)
+    }
+
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        validate_delete_files(&self.added_delete_files, "added")?;
+        let metadata = self.table.metadata();
+        for delete_file in &self.added_delete_files {
+            validate_delete_file_format(delete_file, metadata.format_version())?;
+            // A delete file is written under the partition spec of the data it deletes from,
+            // which need not be the default spec.
+            let partition_spec = self.partition_spec(delete_file.partition_spec_id)?;
+            let schema = self.partition_schema(partition_spec, delete_file.partition());
+            Self::validate_partition_value(
+                delete_file.partition(),
+                &partition_spec.partition_type(&schema)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The files this commit removes, for matching against manifest entries.
+    pub(crate) fn removed_files(&self) -> RemovedFiles<'_> {
+        RemovedFiles::new(&self.deleted_data_files, &self.deleted_delete_files)
     }
 
     fn validate_added_file_partitions(&self, added_files: &[DataFile]) -> Result<()> {
