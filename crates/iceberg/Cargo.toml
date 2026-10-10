@@ -69,6 +69,7 @@ parquet = { workspace = true, features = [
   "async",
   "encryption",
   "arrow_canonical_extension_types",
+  "variant_experimental",
 ] }
 rand = { workspace = true }
 reqwest = { workspace = true }

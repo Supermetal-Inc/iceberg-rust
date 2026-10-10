@@ -19,3 +19,4 @@
 //! API, so they also pin the API Supermetal depends on.
 
 mod utc;
+mod variant;
