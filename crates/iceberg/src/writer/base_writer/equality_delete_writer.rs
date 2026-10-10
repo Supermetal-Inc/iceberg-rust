@@ -21,12 +21,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
 use itertools::Itertools;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
-use crate::arrow::schema_to_arrow_schema;
+use crate::arrow::{VariantExtensionType, schema_to_arrow_schema};
 use crate::error::invalid_data;
 use crate::spec::{DataFile, PartitionKey, Schema, SchemaRef};
 use crate::writer::file_writer::FileWriterBuilder;
@@ -134,7 +135,9 @@ impl EqualityDeleteWriterConfig {
                         .map_err(|e| Error::new(ErrorKind::Unexpected, e.to_string()))?,
                 ))
             },
-            |_field: &Field| true,
+            // A variant's `metadata` and `value` children carry no field id; don't
+            // descend into them.
+            |field: &Field| field.extension_type_name() != Some(VariantExtensionType::NAME),
         )?;
         Ok(Self {
             equality_ids,

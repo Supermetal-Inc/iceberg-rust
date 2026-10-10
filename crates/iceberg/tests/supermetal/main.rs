@@ -20,3 +20,4 @@
 
 mod utc;
 mod variant;
+mod variant_equality_delete;
