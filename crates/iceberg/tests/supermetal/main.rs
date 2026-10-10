@@ -18,6 +18,7 @@
 //! Tests for the Supermetal fork's patches, one module per patch. They use only the public
 //! API, so they also pin the API Supermetal depends on.
 
+mod iceberg_schema;
 mod utc;
 mod variant;
 mod variant_equality_delete;

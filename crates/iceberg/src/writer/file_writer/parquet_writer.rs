@@ -29,7 +29,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::encryption::encrypt::FileEncryptionProperties;
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
@@ -50,6 +50,9 @@ use crate::spec::{
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
+
+/// The key used to store the Iceberg schema JSON in the Parquet file footer metadata.
+const ICEBERG_SCHEMA_KEY: &str = "iceberg.schema";
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
 #[derive(Clone, Debug)]
@@ -77,12 +80,32 @@ impl ParquetWriterBuilder {
         schema: SchemaRef,
         match_mode: FieldMatchMode,
     ) -> Self {
+        let props = Self::add_iceberg_schema_metadata(props, &schema);
         Self {
             props,
             schema,
             match_mode,
             encryption_manager: None,
         }
+    }
+
+    /// Adds the `iceberg.schema` key-value metadata to the Parquet writer properties.
+    ///
+    /// This embeds the full Iceberg schema JSON (including field IDs, types, and
+    /// schema ID) into the Parquet file footer, as the Java implementation does.
+    fn add_iceberg_schema_metadata(props: WriterProperties, schema: &Schema) -> WriterProperties {
+        let schema_json = serde_json::to_string(schema)
+            .expect("Iceberg schema serialization to JSON should not fail");
+
+        // Preserve any existing key-value metadata from the caller
+        let mut kv_metadata = props.key_value_metadata().cloned().unwrap_or_default();
+        kv_metadata.retain(|kv| kv.key != ICEBERG_SCHEMA_KEY);
+        kv_metadata.push(KeyValue::new(ICEBERG_SCHEMA_KEY.to_string(), schema_json));
+
+        props
+            .into_builder()
+            .set_key_value_metadata(Some(kv_metadata))
+            .build()
     }
 
     /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
