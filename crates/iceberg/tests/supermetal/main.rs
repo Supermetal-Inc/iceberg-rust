@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Tests for the Supermetal fork's patches, one module per patch. They use only the public
-//! API, so they also pin the API Supermetal depends on.
+//! Tests for the Supermetal fork's patches through the public API, one module per patch.
+//! `app_api` holds the calls Supermetal makes.
 
+mod app_api;
 mod iceberg_schema;
 mod utc;
 mod variant;
