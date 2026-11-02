@@ -46,7 +46,6 @@ async fn test_add_field() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("rest", fixture.catalog_config.clone())
@@ -74,7 +73,7 @@ async fn test_add_field() {
             .try_into()
             .unwrap(),
     );
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_generator = DefaultFileNameGenerator::new(
         "test".to_string(),
         None,
@@ -306,7 +305,6 @@ async fn test_delete_field() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("rest", fixture.catalog_config.clone())
@@ -334,7 +332,7 @@ async fn test_delete_field() {
             .try_into()
             .unwrap(),
     );
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let file_name_generator = DefaultFileNameGenerator::new(
         "test".to_string(),
         None,

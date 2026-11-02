@@ -29,24 +29,31 @@ mod tests {
     use std::sync::Arc;
 
     use iceberg::io::{
-        FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
+        FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+        S3_SECRET_ACCESS_KEY,
     };
     use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
-    use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
+    use iceberg_test_utils::{get_object_store_endpoint, normalize_test_name_with_parts, set_up};
 
     fn get_resolving_file_io() -> iceberg::io::FileIO {
         set_up();
 
-        let minio_endpoint = get_minio_endpoint();
+        let object_store_endpoint = get_object_store_endpoint();
 
         FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
             .with_props(vec![
-                (S3_ENDPOINT, minio_endpoint),
+                (S3_ENDPOINT, object_store_endpoint),
                 (S3_ACCESS_KEY_ID, "admin".to_string()),
                 (S3_SECRET_ACCESS_KEY, "password".to_string()),
                 (S3_REGION, "us-east-1".to_string()),
+                (S3_PATH_STYLE_ACCESS, "true".to_string()),
             ])
             .build()
+    }
+
+    fn roundtrip_file_io(file_io: &iceberg::io::FileIO) -> iceberg::io::FileIO {
+        let serialized = file_io.serialize_all().unwrap();
+        iceberg::io::FileIO::deserialize_all(&serialized).unwrap()
     }
 
     fn temp_fs_path(name: &str) -> String {
@@ -60,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_scheme_write_and_read() {
-        let file_io = get_resolving_file_io();
+        let file_io = roundtrip_file_io(&get_resolving_file_io());
 
         let s3_path = format!(
             "s3://bucket1/{}",
@@ -255,19 +262,21 @@ mod tests {
     #[cfg(feature = "opendal-s3")]
     #[tokio::test]
     async fn test_with_custom_credential_loader() {
-        use async_trait::async_trait;
-        use iceberg_storage_opendal::CustomAwsCredentialLoader;
-        use reqsign::{AwsCredential, AwsCredentialLoad};
-        use reqwest::Client;
+        use iceberg_storage_opendal::{
+            AwsCredential, CustomAwsCredentialLoader, ProvideCredential,
+        };
+        use reqsign_core::Context;
 
-        struct MinioCredentialLoader;
+        #[derive(Debug)]
+        struct ObjectStoreCredentialLoader;
 
-        #[async_trait]
-        impl AwsCredentialLoad for MinioCredentialLoader {
-            async fn load_credential(
+        impl ProvideCredential for ObjectStoreCredentialLoader {
+            type Credential = AwsCredential;
+
+            async fn provide_credential(
                 &self,
-                _client: Client,
-            ) -> anyhow::Result<Option<AwsCredential>> {
+                _ctx: &Context,
+            ) -> reqsign_core::Result<Option<AwsCredential>> {
                 Ok(Some(AwsCredential {
                     access_key_id: "admin".to_string(),
                     secret_access_key: "password".to_string(),
@@ -278,16 +287,16 @@ mod tests {
         }
 
         set_up();
-        let minio_endpoint = get_minio_endpoint();
+        let object_store_endpoint = get_object_store_endpoint();
 
-        let factory = OpenDalResolvingStorageFactory::new().with_s3_credential_loader(
-            CustomAwsCredentialLoader::new(Arc::new(MinioCredentialLoader)),
-        );
+        let factory = OpenDalResolvingStorageFactory::new()
+            .with_s3_credential_loader(CustomAwsCredentialLoader::new(ObjectStoreCredentialLoader));
 
         let file_io = FileIOBuilder::new(Arc::new(factory))
             .with_props(vec![
-                (S3_ENDPOINT, minio_endpoint),
+                (S3_ENDPOINT, object_store_endpoint),
                 (S3_REGION, "us-east-1".to_string()),
+                (S3_PATH_STYLE_ACCESS, "true".to_string()),
             ])
             .build();
 

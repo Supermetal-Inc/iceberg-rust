@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -27,14 +26,15 @@ use crate::spec::{
     ManifestStatus, Operation,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+use crate::transaction::snapshot::changes::{
+    ChangeSnapshotState, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::validate::SnapshotValidator;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind};
 
 /// Row level changes packed into one snapshot.
+#[derive(Clone)]
 pub struct RowDeltaAction {
     check_duplicate: bool,
     commit_uuid: Option<Uuid>,
@@ -65,31 +65,37 @@ impl RowDeltaAction {
         self
     }
 
+    /// Adds data files to the snapshot.
     pub fn add_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_data_files.extend(data_files);
         self
     }
 
+    /// Adds row-delete files to the snapshot.
     pub fn add_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_delete_files.extend(delete_files);
         self
     }
 
+    /// Removes prior row-delete files from the snapshot.
     pub fn remove_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.removed_delete_files.extend(delete_files);
         self
     }
 
+    /// Sets the commit UUID.
     pub fn set_commit_uuid(mut self, commit_uuid: Uuid) -> Self {
         self.commit_uuid = Some(commit_uuid);
         self
     }
 
+    /// Sets key metadata for newly written manifests.
     pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
         self.key_metadata = Some(key_metadata);
         self
     }
 
+    /// Sets additional snapshot summary properties.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
         self
@@ -167,7 +173,15 @@ impl Default for RowDeltaAction {
 
 #[async_trait]
 impl TransactionAction for RowDeltaAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = ChangeSnapshotState;
+
+    fn new_state(&self) -> Self::State {
+        ChangeSnapshotState::new(self.commit_uuid)
+    }
+
+    async fn cleanup(self, _state: Self::State, _table: &Table, _status: super::CommitStatus) {}
+
+    async fn commit(&self, state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         if self.added_data_files.is_empty()
             && self.added_delete_files.is_empty()
             && self.removed_delete_files.is_empty()
@@ -185,7 +199,7 @@ impl TransactionAction for RowDeltaAction {
 
         let snapshot_producer = SnapshotProducer::new(
             table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            state,
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
@@ -206,9 +220,7 @@ impl TransactionAction for RowDeltaAction {
             has_added_deletes: !self.added_delete_files.is_empty(),
         };
 
-        snapshot_producer
-            .commit(operation, DefaultManifestProcess)
-            .await
+        snapshot_producer.commit(operation).await
     }
 }
 
@@ -243,11 +255,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_producer.table.file_io(),
-                snapshot_producer.table.metadata(),
-            )
+        let manifest_list = snapshot_producer
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let removed_paths: HashSet<&str> = snapshot_producer
@@ -258,8 +269,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
 
         let mut entries = Vec::with_capacity(snapshot_producer.deleted_delete_files.len());
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(snapshot_producer.table.file_io())
+            let manifest = snapshot_producer
+                .table
+                .object_cache()
+                .get_manifest(manifest_file)
                 .await?;
             for entry in manifest.entries() {
                 if !entry.is_alive() {
@@ -272,7 +285,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
                     continue;
                 }
                 if removed_paths.contains(entry.data_file().file_path()) {
-                    entries.push(copy_with_deleted_status(entry.as_ref())?);
+                    entries.push(entry.as_ref().clone());
                 }
             }
         }
@@ -287,11 +300,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_producer.table.file_io(),
-                snapshot_producer.table.metadata(),
-            )
+        let manifest_list = snapshot_producer
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         if snapshot_producer.deleted_delete_files.is_empty() {
@@ -311,8 +323,10 @@ impl SnapshotProduceOperation for RowDeltaOperation {
 
         let mut existing = Vec::new();
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(snapshot_producer.table.file_io())
+            let manifest = snapshot_producer
+                .table
+                .object_cache()
+                .get_manifest(manifest_file)
                 .await?;
 
             let mut has_removal = false;
@@ -361,16 +375,6 @@ impl SnapshotProduceOperation for RowDeltaOperation {
     }
 }
 
-fn copy_with_deleted_status(entry: &ManifestEntry) -> Result<ManifestEntry> {
-    Ok(ManifestEntry::builder()
-        .status(ManifestStatus::Deleted)
-        .snapshot_id_opt(entry.snapshot_id())
-        .sequence_number_opt(entry.sequence_number())
-        .file_sequence_number_opt(entry.file_sequence_number)
-        .data_file(entry.data_file().clone())
-        .build())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -380,10 +384,11 @@ mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, ManifestStatus,
         Operation, Struct,
     };
+    use crate::transaction::Transaction;
     use crate::transaction::tests::{
-        data_file, first_snapshot, make_v2_minimal_table, pos_delete_v2, table_with_snapshot,
+        commit_action, data_file, first_snapshot, make_v2_minimal_table, pos_delete_v2,
+        table_with_snapshot,
     };
-    use crate::transaction::{Transaction, TransactionAction};
     use crate::{Error, TableUpdate};
 
     fn extract_operation(updates: &[TableUpdate]) -> Operation {
@@ -399,7 +404,7 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.row_delta();
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_action(action, &table).await;
         assert!(result.is_err());
     }
 
@@ -409,7 +414,7 @@ mod tests {
         let tx = Transaction::new(&table);
         let file = data_file("test/data.parquet", &table);
         let action = tx.row_delta().add_data_files(vec![file]);
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Append);
     }
@@ -420,7 +425,7 @@ mod tests {
         let tx = Transaction::new(&table);
         let delete = pos_delete_v2("test/delete.parquet", &table);
         let action = tx.row_delta().add_delete_files(vec![delete]);
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Delete);
     }
@@ -433,7 +438,7 @@ mod tests {
             .row_delta()
             .add_data_files(vec![data_file("test/data.parquet", &table)])
             .add_delete_files(vec![pos_delete_v2("test/delete.parquet", &table)]);
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Overwrite);
     }
@@ -443,23 +448,23 @@ mod tests {
         let base = make_v2_minimal_table();
         let delete = pos_delete_v2("test/delete.parquet", &base);
 
-        let mut first_commit = Arc::new(
+        let mut first_commit = commit_action(
             Transaction::new(&base)
                 .row_delta()
                 .add_delete_files(vec![delete.clone()]),
+            &base,
         )
-        .commit(&base)
         .await
         .unwrap();
         let table = table_with_snapshot(&base, first_snapshot(first_commit.take_updates()));
 
-        let result = Arc::new(
+        let result = commit_action(
             Transaction::new(&table)
                 .row_delta()
                 .with_check_duplicate(true)
                 .add_delete_files(vec![delete]),
+            &table,
         )
-        .commit(&table)
         .await;
         let error = match result {
             Err(error) => error,
@@ -475,7 +480,7 @@ mod tests {
         let action = tx
             .row_delta()
             .add_delete_files(vec![data_file("test/wrong.parquet", &table)]);
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_action(action, &table).await;
         assert!(matches!(result, Err(Error { .. })));
     }
 
@@ -490,7 +495,7 @@ mod tests {
         let action = tx
             .row_delta()
             .add_delete_files(vec![pos_delete_v2("test/del.parquet", &table)]);
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_action(action, &table).await;
         match result {
             Err(e) => assert!(e.to_string().contains("V3 requires deletion vectors")),
             Ok(_) => panic!("expected V3 to reject parquet position deletes"),
@@ -516,7 +521,7 @@ mod tests {
 
         let tx = Transaction::new(&table);
         let action = tx.row_delta().add_delete_files(vec![dv]);
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_action(action, &table).await;
         match result {
             Err(e) => assert!(e.to_string().contains("V2 forbids deletion vectors")),
             Ok(_) => panic!("expected V2 to reject puffin position deletes"),
@@ -531,7 +536,7 @@ mod tests {
             .add_data_files(vec![data_file("test/new.parquet", &table)])
             .remove_delete_files(vec![pos_delete_v2("test/prior.parquet", &table)]);
 
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Append);
     }
@@ -545,7 +550,7 @@ mod tests {
             .add_delete_files(vec![pos_delete_v2("test/new_del.parquet", &table)])
             .remove_delete_files(vec![pos_delete_v2("test/prior_del.parquet", &table)]);
 
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         assert_eq!(extract_operation(&updates), Operation::Overwrite);
     }
@@ -560,7 +565,7 @@ mod tests {
             .row_delta()
             .set_snapshot_properties(props)
             .add_data_files(vec![data_file("test/data.parquet", &table)]);
-        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut commit = commit_action(action, &table).await.unwrap();
         let updates = commit.take_updates();
         if let TableUpdate::AddSnapshot { snapshot } = &updates[0] {
             assert_eq!(
@@ -593,25 +598,25 @@ mod tests {
         prior_shell.record_count = 0;
         let survivor = pos_delete_v2("test/survivor.parquet", &base);
 
-        let mut commit_s1 = Arc::new(
+        let mut commit_s1 = commit_action(
             Transaction::new(&base)
-                .fast_append()
-                .add_data_files(vec![prior.clone(), survivor.clone()]),
+                .row_delta()
+                .add_delete_files(vec![prior.clone(), survivor.clone()]),
+            &base,
         )
-        .commit(&base)
         .await
         .unwrap();
         let snap_s1 = first_snapshot(commit_s1.take_updates());
         let s1_seq = snap_s1.sequence_number();
         let table_s1 = table_with_snapshot(&base, snap_s1);
 
-        let mut commit_s2 = Arc::new(
+        let mut commit_s2 = commit_action(
             Transaction::new(&table_s1)
                 .row_delta()
                 .add_data_files(vec![data_file("test/new.parquet", &table_s1)])
                 .remove_delete_files(vec![prior_shell]),
+            &table_s1,
         )
-        .commit(&table_s1)
         .await
         .unwrap();
         let updates_s2 = commit_s2.take_updates();
@@ -634,8 +639,9 @@ mod tests {
                 .unwrap(),
             "5"
         );
-        let manifests = snap_s2
-            .load_manifest_list(table_s1.file_io(), table_s1.metadata())
+        let manifests = table_s1
+            .manifest_list_reader(&Arc::new(snap_s2))
+            .load()
             .await
             .unwrap();
 
@@ -644,7 +650,7 @@ mod tests {
         let mut saw_new_added = false;
 
         for mf in manifests.entries() {
-            let manifest = mf.load_manifest(table_s1.file_io()).await.unwrap();
+            let manifest = table_s1.object_cache().get_manifest(mf).await.unwrap();
             for entry in manifest.entries() {
                 let path = entry.data_file().file_path();
                 let status = entry.status();
@@ -668,5 +674,44 @@ mod tests {
         assert!(saw_prior_deleted, "prior delete file missing DELETED entry");
         assert!(saw_survivor_existing, "survivor missing EXISTING entry");
         assert!(saw_new_added, "new data file missing ADDED entry");
+    }
+    #[tokio::test]
+    async fn retries_keep_snapshot_id_but_write_distinct_artifacts() {
+        use crate::transaction::TransactionAction;
+        let table = make_v2_minimal_table();
+        let action = Transaction::new(&table)
+            .row_delta()
+            .add_data_files([data_file("test/retry.parquet", &table)]);
+        let mut state = action.new_state();
+        let first = first_snapshot(
+            action
+                .commit(&mut state, &table)
+                .await
+                .unwrap()
+                .take_updates(),
+        );
+        let second = first_snapshot(
+            action
+                .commit(&mut state, &table)
+                .await
+                .unwrap()
+                .take_updates(),
+        );
+        assert_eq!(first.snapshot_id(), second.snapshot_id());
+        assert_ne!(first.manifest_list(), second.manifest_list());
+        let first_manifests = table
+            .manifest_list_reader(&Arc::new(first))
+            .load()
+            .await
+            .unwrap();
+        let second_manifests = table
+            .manifest_list_reader(&Arc::new(second))
+            .load()
+            .await
+            .unwrap();
+        assert_ne!(
+            first_manifests.entries()[0].manifest_path,
+            second_manifests.entries()[0].manifest_path
+        );
     }
 }

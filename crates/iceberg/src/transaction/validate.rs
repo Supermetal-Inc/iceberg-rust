@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use futures::SinkExt;
 use futures::future::try_join_all;
@@ -88,11 +87,8 @@ pub(crate) trait SnapshotValidator {
         let mut new_snapshots = HashSet::new();
         let mut last_snapshot: Option<SnapshotRef> = None;
 
-        let snapshots = ancestors_between(
-            &Arc::new(base.metadata().clone()),
-            to_snapshot_id,
-            from_snapshot_id,
-        );
+        let metadata = base.metadata_ref();
+        let snapshots = ancestors_between(&metadata, to_snapshot_id, from_snapshot_id);
 
         for current_snapshot in snapshots {
             last_snapshot = Some(current_snapshot.clone());
@@ -101,8 +97,8 @@ pub(crate) trait SnapshotValidator {
             // and their manifest files with the matching content type
             if matching_operations.contains(&current_snapshot.summary().operation) {
                 new_snapshots.insert(current_snapshot.snapshot_id());
-                current_snapshot
-                    .load_manifest_list(base.file_io(), base.metadata())
+                base.manifest_list_reader(&current_snapshot)
+                    .load()
                     .await?
                     .entries()
                     .iter()
@@ -176,11 +172,12 @@ pub(crate) trait SnapshotValidator {
             .await?;
 
         // Build delete file index
-        let (delete_file_index, mut delete_file_tx) = DeleteFileIndex::new();
+        let (delete_file_index, mut delete_file_tx) = DeleteFileIndex::new(base.runtime().clone());
+        let cache = base.object_cache();
         let manifests = try_join_all(
             delete_manifests
                 .iter()
-                .map(|f| f.load_manifest(base.file_io()))
+                .map(|f| cache.get_manifest(f))
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -208,12 +205,12 @@ pub(crate) trait SnapshotValidator {
         for data_file in data_files {
             let delete_files = delete_file_index
                 .get_deletes_for_data_file(data_file, Some(starting_sequence_number))
-                .await;
+                .await?;
 
             if ignore_equality_deletes {
                 if delete_files
                     .iter()
-                    .any(|delete_file| delete_file.file_type == DataContentType::PositionDeletes)
+                    .any(|delete_file| delete_file.file_type() == DataContentType::PositionDeletes)
                 {
                     return Err(Error::new(
                         ErrorKind::DataInvalid,

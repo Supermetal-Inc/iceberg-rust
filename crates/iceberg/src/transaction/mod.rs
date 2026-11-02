@@ -56,6 +56,10 @@ pub use action::*;
 mod append;
 mod replace_files;
 mod row_delta;
+mod validate;
+pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
+pub use row_delta::RowDeltaAction;
+mod expire_snapshots;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -63,7 +67,6 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
-mod validate;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,23 +77,21 @@ pub use update_schema::AddColumn;
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
-use crate::transaction::append::FastAppendAction;
-use crate::transaction::replace_files::{OverwriteFilesAction, RewriteFilesAction};
-use crate::transaction::row_delta::RowDeltaAction;
-use crate::transaction::sort_order::ReplaceSortOrderAction;
-use crate::transaction::update_location::UpdateLocationAction;
-use crate::transaction::update_properties::UpdatePropertiesAction;
-use crate::transaction::update_schema::UpdateSchemaAction;
-use crate::transaction::update_statistics::UpdateStatisticsAction;
-use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
+use crate::transaction::action::TransactionActionEntry;
+pub use crate::transaction::append::FastAppendAction;
+pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::sort_order::ReplaceSortOrderAction;
+pub use crate::transaction::update_location::UpdateLocationAction;
+pub use crate::transaction::update_properties::UpdatePropertiesAction;
+pub use crate::transaction::update_schema::UpdateSchemaAction;
+pub use crate::transaction::update_statistics::UpdateStatisticsAction;
+pub use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
+use crate::{Catalog, Error, ErrorKind, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
-#[derive(Clone)]
 pub struct Transaction {
     table: Table,
-    actions: Vec<BoxedTransactionAction>,
+    actions: Vec<TransactionActionEntry>,
 }
 
 impl Transaction {
@@ -154,25 +155,24 @@ impl Transaction {
         FastAppendAction::new()
     }
 
-    /// Creates replace sort order action.
-    pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
-        ReplaceSortOrderAction::new()
-    }
-
-    /// Rewrite a set of data files of table
+    /// Rewrites files without changing table data.
     pub fn rewrite_files(&self) -> RewriteFilesAction {
         RewriteFilesAction::new()
     }
 
-    /// Overwrite a set of data files of table.
+    /// Replaces files as a logical overwrite.
     pub fn overwrite_files(&self) -> OverwriteFilesAction {
         OverwriteFilesAction::new()
     }
 
-    /// Row delta. Adds data files and delete files, and optionally marks
-    /// prior delete files as DELETED in the same snapshot.
+    /// Adds data and delete files and removes prior delete files in one snapshot.
     pub fn row_delta(&self) -> RowDeltaAction {
         RowDeltaAction::new()
+    }
+
+    /// Creates replace sort order action.
+    pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
+        ReplaceSortOrderAction::new()
     }
 
     /// Set the location of table
@@ -185,14 +185,30 @@ impl Transaction {
         UpdateStatisticsAction::new()
     }
 
+    /// Expire snapshots from the table metadata.
+    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
+        ExpireSnapshotsAction::new()
+    }
+
     /// Commit transaction.
+    ///
+    /// Returns `ErrorKind::PreconditionFailed` if the table is read-only
+    /// (`Table::readonly()`), even when the transaction has no actions.
     pub async fn commit(self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.table.readonly() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Cannot modify a read-only table",
+            )
+            .with_context("table", self.table.identifier().to_string()));
+        }
+
         if self.actions.is_empty() {
             // nothing to commit
             return Ok(self.table);
         }
 
-        let table_props = self.table.metadata().table_properties()?;
+        let table_props = self.table.metadata().table_properties();
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
@@ -209,28 +225,29 @@ impl Transaction {
         .1
     }
 
-    /// Build and submit this transaction once using its original table metadata.
-    ///
-    /// Unlike [`Transaction::commit`], this method does not reload the table,
-    /// rebase the transaction, or retry a failed catalog update. A concurrent
-    /// catalog update therefore returns directly to the caller, which can
-    /// rebuild the transaction against fresh table metadata before retrying.
-    pub async fn commit_once(self, catalog: &dyn Catalog) -> Result<Table> {
+    /// Submits against the original table metadata without reloading or retrying.
+    pub async fn commit_once(mut self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.table.readonly() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "Cannot modify a read-only table",
+            )
+            .with_context("table", self.table.identifier().to_string()));
+        }
         if self.actions.is_empty() {
             return Ok(self.table);
         }
-
         self.commit_current(catalog).await
     }
 
-    fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
+    fn build_backoff(props: TableProperties<'_>) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
-            .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
-            .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms))
+            .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms()?))
+            .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms()?))
             .with_total_delay(Some(Duration::from_millis(
-                props.commit_total_retry_timeout_ms,
+                props.commit_total_retry_timeout_ms()?,
             )))
-            .with_max_times(props.commit_num_retries)
+            .with_max_times(props.commit_num_retries()?)
             .with_factor(2.0)
             .build())
     }
@@ -248,13 +265,13 @@ impl Transaction {
         self.commit_current(catalog).await
     }
 
-    async fn commit_current(&self, catalog: &dyn Catalog) -> Result<Table> {
+    async fn commit_current(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let mut current_table = self.table.clone();
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
-        for action in &self.actions {
-            let action_commit = Arc::clone(action).commit(&current_table).await?;
+        for entry in self.actions.iter_mut() {
+            let action_commit = entry.commit(&current_table).await?;
             // apply action commit to current_table
             current_table = Self::apply(
                 current_table,
@@ -275,7 +292,7 @@ impl Transaction {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
@@ -284,75 +301,22 @@ mod tests {
 
     use crate::catalog::MockCatalog;
     use crate::io::FileIO;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Snapshot,
-        Struct, TableMetadata, TableMetadataBuilder,
+        Struct, TableMetadata, TableMetadataBuilder, TableProperties,
     };
-    use crate::table::Table;
+    use crate::table::{StaticTable, Table};
+    use crate::test_utils::{make_encrypted_table, test_runtime};
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent, TableUpdate};
 
-    pub fn make_v1_table() -> Table {
-        let file = File::open(format!(
-            "{}/testdata/table_metadata/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            "TableMetadataV1Valid.json"
-        ))
-        .unwrap();
-        let reader = BufReader::new(file);
-        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
-
-        Table::builder()
-            .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
-            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIO::new_with_memory())
-            .build()
-            .unwrap()
-    }
-
-    pub fn make_v2_table() -> Table {
-        let file = File::open(format!(
-            "{}/testdata/table_metadata/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            "TableMetadataV2Valid.json"
-        ))
-        .unwrap();
-        let reader = BufReader::new(file);
-        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
-
-        Table::builder()
-            .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
-            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIO::new_with_memory())
-            .build()
-            .unwrap()
-    }
-
-    pub fn make_v2_minimal_table() -> Table {
-        make_minimal_table("TableMetadataV2ValidMinimal.json")
-    }
-
-    pub fn make_v3_minimal_table() -> Table {
-        make_minimal_table("TableMetadataV3ValidMinimal.json")
-    }
-
-    fn make_minimal_table(metadata_file: &str) -> Table {
-        let file = File::open(format!(
-            "{}/testdata/table_metadata/{metadata_file}",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
-        let metadata = serde_json::from_reader::<_, TableMetadata>(BufReader::new(file)).unwrap();
-
-        Table::builder()
-            .metadata(metadata)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
-            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIO::new_with_memory())
-            .build()
-            .unwrap()
+    pub async fn commit_action<A: super::TransactionAction>(
+        action: A,
+        table: &Table,
+    ) -> crate::Result<super::ActionCommit> {
+        let mut state = action.new_state();
+        action.commit(&mut state, table).await
     }
 
     pub fn data_file(path: &str, table: &Table) -> DataFile {
@@ -403,6 +367,123 @@ mod tests {
         base.clone().with_metadata(Arc::new(updated))
     }
 
+    #[tokio::test]
+    async fn test_commit_once_does_not_reload_or_retry() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+        let mut mock_catalog = MockCatalog::new();
+
+        mock_catalog.expect_load_table().times(0);
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async {
+                    Err(
+                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                            .with_retryable(true),
+                    )
+                })
+            });
+
+        let error = tx.commit_once(&mock_catalog).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(error.retryable());
+    }
+
+    pub fn make_v1_table() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV1Valid.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    pub fn make_v2_table() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2Valid.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    pub fn make_v2_minimal_table() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV2ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    pub(crate) fn make_v3_minimal_table() -> Table {
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV3ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+        Table::builder()
+            .metadata(resp)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    async fn make_v2_minimal_readonly_table() -> Table {
+        let table = make_v2_minimal_table();
+        StaticTable::from_metadata(
+            table.metadata().clone(),
+            table.identifier().clone(),
+            FileIO::new_with_memory(),
+        )
+        .await
+        .unwrap()
+        .into_table()
+    }
+
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
@@ -413,8 +494,14 @@ mod tests {
             .await
             .unwrap();
 
-        let base = make_v3_minimal_table();
-        let base_metadata = base.metadata();
+        let file = File::open(format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            "TableMetadataV3ValidMinimal.json"
+        ))
+        .unwrap();
+        let reader = BufReader::new(file);
+        let base_metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
 
         let table_creation = TableCreation::builder()
             .schema((**base_metadata.current_schema()).clone())
@@ -432,8 +519,11 @@ mod tests {
 
     /// Helper function to create a test table with retry properties
     pub(super) fn setup_test_table(num_retries: &str) -> Table {
-        let table = make_v2_table();
+        with_retry_properties(make_v2_table(), num_retries)
+    }
 
+    /// Sets fast commit retry properties on `table`.
+    pub(super) fn with_retry_properties(table: Table, num_retries: &str) -> Table {
         // Set retry properties
         let mut props = HashMap::new();
         props.insert("commit.retry.min-wait-ms".to_string(), "10".to_string());
@@ -598,28 +688,145 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_once_does_not_reload_or_retry() {
-        let table = setup_test_table("3");
-        let tx = create_test_transaction(&table);
-        let mut mock_catalog = MockCatalog::new();
+    async fn test_transaction_snapshot_summary() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
 
-        mock_catalog.expect_load_table().times(0);
+        let mut file_seq = 0u32;
+        let mut append_file = |table: &Table, record_count: u64, file_size: u64| {
+            file_seq += 1;
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("test/{file_seq}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size)
+                .record_count(record_count)
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .partition_spec_id(0)
+                .build()
+                .unwrap();
+            let tx = Transaction::new(table);
+            tx.fast_append()
+                .add_data_files(vec![file])
+                .apply(tx)
+                .unwrap()
+        };
+
+        let table = append_file(&table, /*record_count=*/ 10, /*file_size=*/ 100)
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let table = append_file(&table, /*record_count=*/ 20, /*file_size=*/ 200)
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let summary = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+
+        assert_eq!(summary.get("total-records").unwrap(), "30");
+        assert_eq!(summary.get("total-data-files").unwrap(), "2");
+        assert_eq!(summary.get("total-files-size").unwrap(), "300");
+    }
+
+    #[tokio::test]
+    async fn test_commit_to_encrypted_table() {
+        let table = make_encrypted_table().await.with_metadata_location(
+            "memory:///table/metadata/00000-9c12d441-03fe-4693-9a96-a0705ddf69c1.metadata.json"
+                .to_string(),
+        );
+        let refreshed_table = table.clone();
+        let update_table = table.clone();
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog
+            .expect_load_table()
+            .times(1)
+            .returning_st(move |_| {
+                let refreshed_table = refreshed_table.clone();
+                Box::pin(async move { Ok(refreshed_table) })
+            });
         mock_catalog
             .expect_update_table()
             .times(1)
-            .returning_st(|_| {
-                Box::pin(async {
-                    Err(
-                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
-                            .with_retryable(true),
-                    )
-                })
+            .returning_st(move |commit| {
+                let update_table = update_table.clone();
+                Box::pin(async move { commit.apply(update_table) })
             });
 
-        let error = tx.commit_once(&mock_catalog).await.unwrap_err();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("test.key".to_string(), "test.value".to_string())
+            .apply(tx)
+            .unwrap();
 
-        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
-        assert!(error.retryable());
+        let updated_table = tx.commit(&mock_catalog).await.unwrap();
+
+        assert_eq!(
+            updated_table
+                .metadata()
+                .properties()
+                .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ID)
+                .map(String::as_str),
+            Some("master-1")
+        );
+        assert_eq!(
+            updated_table
+                .metadata()
+                .properties()
+                .get("test.key")
+                .map(String::as_str),
+            Some("test.value")
+        );
+        assert!(updated_table.encryption_manager().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_commit_readonly_table_fails() {
+        let table = make_v2_minimal_readonly_table().await;
+        let catalog = MockCatalog::new();
+
+        // make sure even empty transactions fail
+        let err = Transaction::new(&table).commit(&catalog).await.unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+        assert_eq!(err.message(), "Cannot modify a read-only table");
+        assert_eq!(
+            Transaction::new(&table)
+                .commit_once(&catalog)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PreconditionFailed
+        );
+        assert!(!err.retryable(), "Error should not be retryable");
+    }
+
+    #[tokio::test]
+    async fn test_commit_readonly_table_with_actions_fails() {
+        let table = make_v2_minimal_readonly_table().await;
+        let catalog = MockCatalog::new();
+
+        let err = create_test_transaction(&table)
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn test_commit_empty_transaction_is_noop() {
+        let table = make_v2_minimal_table();
+        let catalog = MockCatalog::new();
+
+        let result = Transaction::new(&table).commit(&catalog).await.unwrap();
+
+        assert_eq!(result.metadata(), table.metadata());
     }
 }
 
@@ -667,13 +874,8 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         assert_eq!(manifest_list.entries().len(), 1);
         let manifest_file = &manifest_list.entries()[0];
@@ -695,13 +897,7 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30 + 17 + 11);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));

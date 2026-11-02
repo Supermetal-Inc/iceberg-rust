@@ -17,17 +17,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::snapshot::{DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer};
+use super::snapshot::changes::{ChangeSnapshotState, SnapshotProduceOperation, SnapshotProducer};
 use super::{ActionCommit, TransactionAction};
 use crate::error::{Error, ErrorKind, Result};
-use crate::spec::{
-    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
-};
+use crate::spec::{DataContentType, DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::validate::SnapshotValidator;
 
@@ -35,14 +32,16 @@ use crate::transaction::validate::SnapshotValidator;
 ///
 /// Rewrites and overwrites share the same manifest handling but have different
 /// logical meanings in the Iceberg snapshot summary.
-pub(crate) trait ReplaceFilesMode: Send + Sync + 'static {
+pub(crate) trait ReplaceFilesMode: Clone + Send + Sync + 'static {
     const OPERATION: Operation;
 }
 
 /// Files were replaced without changing table data.
+#[derive(Clone)]
 pub struct Rewrite;
 
 /// Files were replaced as a logical overwrite.
+#[derive(Clone)]
 pub struct Overwrite;
 
 impl ReplaceFilesMode for Rewrite {
@@ -55,6 +54,7 @@ impl ReplaceFilesMode for Overwrite {
 
 /// Transaction action for replacing files.
 #[allow(private_bounds)]
+#[derive(Clone)]
 pub struct ReplaceFilesAction<M: ReplaceFilesMode> {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
@@ -185,10 +185,18 @@ impl<M: ReplaceFilesMode> Default for ReplaceFilesAction<M> {
 
 #[async_trait]
 impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    type State = ChangeSnapshotState;
+
+    fn new_state(&self) -> Self::State {
+        ChangeSnapshotState::new(self.commit_uuid)
+    }
+
+    async fn cleanup(self, _state: Self::State, _table: &Table, _status: super::CommitStatus) {}
+
+    async fn commit(&self, state: &mut Self::State, table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
-            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            state,
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
@@ -209,21 +217,8 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
         };
 
         // todo should be able to configure to use the merge manifest process
-        snapshot_producer
-            .commit(replace_operation, DefaultManifestProcess)
-            .await
+        snapshot_producer.commit(replace_operation).await
     }
-}
-
-fn copy_with_deleted_status(entry: &ManifestEntry) -> Result<ManifestEntry> {
-    let builder = ManifestEntry::builder()
-        .status(ManifestStatus::Deleted)
-        .snapshot_id_opt(entry.snapshot_id())
-        .sequence_number_opt(entry.sequence_number())
-        .file_sequence_number_opt(entry.file_sequence_number)
-        .data_file(entry.data_file().clone());
-
-    Ok(builder.build())
 }
 
 impl<M: ReplaceFilesMode> SnapshotValidator for ReplaceFilesOperation<M> {
@@ -282,18 +277,19 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         let snapshot = snapshot_producer.table.metadata().current_snapshot();
 
         if let Some(snapshot) = snapshot {
-            let manifest_list = snapshot
-                .load_manifest_list(
-                    snapshot_producer.table.file_io(),
-                    snapshot_producer.table.metadata(),
-                )
+            let manifest_list = snapshot_producer
+                .table
+                .manifest_list_reader(snapshot)
+                .load()
                 .await?;
 
             let mut delete_entries = Vec::new();
 
             for manifest_file in manifest_list.entries() {
-                let manifest = manifest_file
-                    .load_manifest(snapshot_producer.table.file_io())
+                let manifest = snapshot_producer
+                    .table
+                    .object_cache()
+                    .get_manifest(manifest_file)
                     .await?;
 
                 for entry in manifest.entries() {
@@ -304,7 +300,7 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                                 .iter()
                                 .any(|f| f.file_path == entry.data_file().file_path)
                             {
-                                delete_entries.push(copy_with_deleted_status(entry.as_ref())?)
+                                delete_entries.push(entry.as_ref().clone())
                             }
                         }
                         DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
@@ -313,7 +309,7 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
                                 .iter()
                                 .any(|f| f.file_path == entry.data_file().file_path)
                             {
-                                delete_entries.push(copy_with_deleted_status(entry.as_ref())?)
+                                delete_entries.push(entry.as_ref().clone())
                             }
                         }
                     }
@@ -334,18 +330,19 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_producer.table.file_io(),
-                snapshot_producer.table.metadata(),
-            )
+        let manifest_list = snapshot_producer
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file
-                .load_manifest(snapshot_producer.table.file_io())
+            let manifest = snapshot_producer
+                .table
+                .object_cache()
+                .get_manifest(manifest_file)
                 .await?;
 
             // Find files to delete from the current manifest entries
@@ -408,17 +405,16 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{Overwrite, ReplaceFilesAction, ReplaceFilesMode, Rewrite};
     use crate::spec::{DataFile, Operation};
     use crate::table::Table;
+    use crate::transaction::Transaction;
     use crate::transaction::tests::{
-        data_file, first_snapshot, make_v2_minimal_table, make_v3_minimal_table, pos_delete_v2,
-        table_with_snapshot,
+        commit_action, data_file, first_snapshot, make_v2_minimal_table, make_v3_minimal_table,
+        pos_delete_v2, table_with_snapshot,
     };
-    use crate::transaction::{Transaction, TransactionAction};
 
     const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -479,12 +475,12 @@ mod tests {
         let starting_snapshot_id = starting_snapshot.snapshot_id();
         let starting_sequence_number = starting_snapshot.sequence_number();
         let concurrent_delete = pos_delete_v2("test/concurrent-delete.parquet", &table_s1);
-        let mut concurrent_commit = Arc::new(
+        let mut concurrent_commit = commit_action(
             Transaction::new(&table_s1)
                 .row_delta()
                 .add_delete_files([concurrent_delete]),
+            &table_s1,
         )
-        .commit(&table_s1)
         .await
         .unwrap();
         let table_s2 =
@@ -501,7 +497,7 @@ mod tests {
             action
         };
 
-        let result = tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(&table_s2))
+        let result = tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, &table_s2))
             .await
             .expect("concurrent delete validation timed out");
         let error = match result {
@@ -520,7 +516,7 @@ mod tests {
             .unwrap()
             .full_table_overwrite();
 
-        tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(table))
+        tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, table))
             .await
             .expect("overwrite validation timed out")
             .expect("overwrite commit failed");
@@ -534,7 +530,7 @@ mod tests {
             .add_data_files([replacement])
             .unwrap();
 
-        tokio::time::timeout(VALIDATION_TIMEOUT, Arc::new(action).commit(table))
+        tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, table))
             .await
             .expect("rewrite validation timed out")
             .expect("rewrite commit failed");
@@ -557,7 +553,7 @@ mod tests {
         let action = Transaction::new(&base)
             .fast_append()
             .add_data_files([existing_file.clone()]);
-        let mut commit = Arc::new(action).commit(&base).await.unwrap();
+        let mut commit = commit_action(action, &base).await.unwrap();
         let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
 
         (table, existing_file)

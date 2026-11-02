@@ -27,8 +27,10 @@ use itertools::Itertools;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::async_writer::AsyncFileWriter as ArrowAsyncFileWriter;
+use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{CdcOptions, WriterProperties};
 use parquet::file::statistics::Statistics;
 
 use super::{FileWriter, FileWriterBuilder};
@@ -36,17 +38,19 @@ use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum,
 };
+use crate::compression::CompressionCodec;
+use crate::encryption::{EncryptionManager, StandardKeyMetadata};
+use crate::error::invalid_data;
 use crate::io::{FileIO, FileWrite, OutputFile};
 use crate::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, Datum, ListType, Literal, MapType,
     NestedFieldRef, PartitionSpec, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct,
-    StructType, TableMetadata, Type, VariantType, visit_schema,
+    StructType, TableMetadata, TableProperties, Type, VariantType, visit_schema,
 };
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
 
-/// The key used to store the Iceberg schema JSON in the Parquet file footer metadata.
 const ICEBERG_SCHEMA_KEY: &str = "iceberg.schema";
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
@@ -55,11 +59,16 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    encryption_manager: Option<Arc<EncryptionManager>>,
 }
 
 impl ParquetWriterBuilder {
     /// Create a new `ParquetWriterBuilder`
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
+    ///
+    /// When writing into an existing Iceberg table, prefer
+    /// [`Self::from_table_properties`], which derives `WriterProperties` from
+    /// the table's `write.parquet.*` properties.
     pub fn new(props: WriterProperties, schema: SchemaRef) -> Self {
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
     }
@@ -75,13 +84,10 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            encryption_manager: None,
         }
     }
 
-    /// Adds the `iceberg.schema` key-value metadata to the Parquet writer properties.
-    ///
-    /// This embeds the full Iceberg schema JSON (including field IDs, types, and
-    /// schema ID) into the Parquet file footer.
     fn add_iceberg_schema_metadata(props: WriterProperties, schema: &Schema) -> WriterProperties {
         let schema_json = serde_json::to_string(schema)
             .expect("Iceberg schema serialization to JSON should not fail");
@@ -90,6 +96,7 @@ impl ParquetWriterBuilder {
 
         // Preserve any existing key-value metadata from the caller
         let mut kv_metadata = props.key_value_metadata().cloned().unwrap_or_default();
+        kv_metadata.retain(|kv| kv.key != ICEBERG_SCHEMA_KEY);
         kv_metadata.push(iceberg_kv);
 
         props
@@ -97,19 +104,99 @@ impl ParquetWriterBuilder {
             .set_key_value_metadata(Some(kv_metadata))
             .build()
     }
+
+    /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
+    /// schema, translating `write.parquet.*` settings into `WriterProperties`
+    /// instead of using parquet-rs defaults.
+    pub fn from_table_properties(
+        table_props: &TableProperties<'_>,
+        schema: SchemaRef,
+    ) -> Result<Self> {
+        let cdc = if table_props.cdc_enabled()? {
+            Some(CdcOptions {
+                min_chunk_size: table_props.cdc_min_chunk_size()?,
+                max_chunk_size: table_props.cdc_max_chunk_size()?,
+                norm_level: table_props.cdc_norm_level()?,
+            })
+        } else {
+            None
+        };
+        let compression = parquet_compression(table_props.parquet_compression_codec()?)?;
+        let props = WriterProperties::builder()
+            .set_content_defined_chunking(cdc)
+            .set_compression(compression)
+            .set_max_row_group_bytes(Some(table_props.parquet_row_group_size_bytes()?))
+            .set_data_page_size_limit(table_props.parquet_page_size_bytes()?)
+            .set_data_page_row_count_limit(table_props.parquet_page_row_limit()?)
+            .set_dictionary_page_size_limit(table_props.parquet_dict_size_bytes()?)
+            .build();
+        Ok(Self::new_with_match_mode(props, schema, FieldMatchMode::Id))
+    }
+
+    /// Set the field match mode used to map Arrow fields to Iceberg fields.
+    ///
+    /// Defaults to [`FieldMatchMode::Id`]. Use [`FieldMatchMode::Name`] when the
+    /// incoming Arrow schema does not carry Iceberg field-id metadata.
+    pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
+        self.match_mode = match_mode;
+        self
+    }
+
+    /// Set the [`EncryptionManager`] used to encrypt written files.
+    pub fn with_encryption_manager(mut self, encryption_manager: Arc<EncryptionManager>) -> Self {
+        self.encryption_manager = Some(encryption_manager);
+        self
+    }
+}
+
+fn parquet_compression(codec: CompressionCodec) -> Result<Compression> {
+    let compression = match codec {
+        CompressionCodec::None => Compression::UNCOMPRESSED,
+        CompressionCodec::Snappy => Compression::SNAPPY,
+        CompressionCodec::Lzo => Compression::LZO,
+        CompressionCodec::Lz4 => Compression::LZ4,
+        CompressionCodec::Lz4Raw => Compression::LZ4_RAW,
+        CompressionCodec::Zstd(level) => {
+            let level =
+                ZstdLevel::try_new(level as i32).map_err(|e| invalid_level_error("zstd", e))?;
+            Compression::ZSTD(level)
+        }
+        CompressionCodec::Gzip(level) => {
+            let level =
+                GzipLevel::try_new(level as u32).map_err(|e| invalid_level_error("gzip", e))?;
+            Compression::GZIP(level)
+        }
+        CompressionCodec::Brotli(level) => {
+            let level =
+                BrotliLevel::try_new(level as u32).map_err(|e| invalid_level_error("brotli", e))?;
+            Compression::BROTLI(level)
+        }
+    };
+    Ok(compression)
+}
+
+fn invalid_level_error(codec: &str, source: impl Into<anyhow::Error>) -> Error {
+    invalid_data!("Invalid {codec} compression level").with_source(source)
 }
 
 impl FileWriterBuilder for ParquetWriterBuilder {
     type R = ParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
+        let key_metadata = self
+            .encryption_manager
+            .as_ref()
+            .map(|em| em.generate_key_metadata());
+        let writer_properties =
+            resolve_writer_properties(self.props.clone(), key_metadata.as_ref())?;
         Ok(ParquetWriter {
             schema: self.schema.clone(),
             inner_writer: None,
-            writer_properties: self.props.clone(),
+            writer_properties,
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            key_metadata,
         })
     }
 }
@@ -136,22 +223,6 @@ impl IndexByParquetPathName {
     /// Retrieves the internal field ID
     pub fn get(&self, name: &str) -> Option<&i32> {
         self.name_to_id.get(name)
-    }
-
-    fn insert_current_path(&mut self) -> Result<()> {
-        let full_name = self.field_names.iter().map(String::as_str).join(".");
-        let field_id = self.field_id;
-        if let Some(existing_field_id) = self.name_to_id.get(full_name.as_str()) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Invalid schema: multiple fields for name {full_name}: {field_id} and {existing_field_id}"
-                ),
-            ));
-        } else {
-            self.name_to_id.insert(full_name, field_id);
-        }
-        Ok(())
     }
 }
 
@@ -231,11 +302,21 @@ impl SchemaVisitor for IndexByParquetPathName {
     }
 
     fn primitive(&mut self, _p: &PrimitiveType) -> Result<Self::T> {
-        self.insert_current_path()
+        let full_name = self.field_names.iter().map(String::as_str).join(".");
+        let field_id = self.field_id;
+        if let Some(existing_field_id) = self.name_to_id.get(full_name.as_str()) {
+            return Err(invalid_data!(
+                "Invalid schema: multiple fields for name {full_name}: {field_id} and {existing_field_id}"
+            ));
+        } else {
+            self.name_to_id.insert(full_name, field_id);
+        }
+
+        Ok(())
     }
 
     fn variant(&mut self, _v: &VariantType) -> Result<Self::T> {
-        self.insert_current_path()
+        self.primitive(&PrimitiveType::Binary)
     }
 }
 
@@ -247,6 +328,7 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    key_metadata: Option<StandardKeyMetadata>,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -289,7 +371,7 @@ impl MinMaxColAggregator {
     }
 
     /// Update statistics
-    fn update(&mut self, field_id: i32, value: Statistics) -> Result<()> {
+    fn update(&mut self, field_id: i32, value: &Statistics) -> Result<()> {
         let Some(ty) = self
             .schema
             .field_by_id(field_id)
@@ -307,25 +389,30 @@ impl MinMaxColAggregator {
         };
 
         if value.min_is_exact() {
-            let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, &value)? else {
+            let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, value)? else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!("Statistics {value} is not match with field type {ty}."),
                 ));
             };
 
-            self.update_state_min(field_id, min_datum);
+            // Iceberg bounds must not be NaN.
+            if !min_datum.is_nan() {
+                self.update_state_min(field_id, min_datum);
+            }
         }
 
         if value.max_is_exact() {
-            let Some(max_datum) = get_parquet_stat_max_as_datum(&ty, &value)? else {
+            let Some(max_datum) = get_parquet_stat_max_as_datum(&ty, value)? else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!("Statistics {value} is not match with field type {ty}."),
                 ));
             };
 
-            self.update_state_max(field_id, max_datum);
+            if !max_datum.is_nan() {
+                self.update_state_max(field_id, max_datum);
+            }
         }
 
         Ok(())
@@ -355,12 +442,10 @@ impl ParquetWriter {
             let reader = input_file.reader().await?;
 
             let mut parquet_reader = ArrowFileReader::new(file_metadata, reader);
-            let parquet_metadata = parquet_reader.get_metadata(None).await.map_err(|err| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Error reading Parquet metadata: {err}"),
-                )
-            })?;
+            let parquet_metadata = parquet_reader
+                .get_metadata(None)
+                .await
+                .map_err(|err| invalid_data!("Error reading Parquet metadata: {err}"))?;
             let mut builder = ParquetWriter::parquet_to_data_file_builder(
                 table_metadata.current_schema().clone(),
                 parquet_metadata,
@@ -368,6 +453,7 @@ impl ParquetWriter {
                 file_path,
                 // TODO: Implement nan_value_counts here
                 HashMap::new(),
+                None,
             )?;
             builder.partition_spec_id(table_metadata.default_partition_spec_id());
             let data_file = builder.build().unwrap();
@@ -384,6 +470,7 @@ impl ParquetWriter {
         written_size: usize,
         file_path: String,
         nan_value_counts: HashMap<i32, u64>,
+        key_metadata: Option<StandardKeyMetadata>,
     ) -> Result<DataFileBuilder> {
         let index_by_parquet_path = {
             let mut visitor = IndexByParquetPathName::new();
@@ -415,7 +502,7 @@ impl ParquetWriter {
                             *per_col_null_val_num.entry(field_id).or_insert(0) += null_count;
                         }
 
-                        min_max_agg.update(field_id, statistics.clone())?;
+                        min_max_agg.update(field_id, statistics)?;
                     }
                 }
             }
@@ -425,6 +512,11 @@ impl ParquetWriter {
                 per_col_null_val_num,
                 min_max_agg.produce(),
             )
+        };
+
+        let key_metadata = match key_metadata {
+            Some(m) => Some(m.encode()?.into_vec()),
+            None => None,
         };
 
         let mut builder = DataFileBuilder::default();
@@ -443,6 +535,7 @@ impl ParquetWriter {
             // - We can ignore implementing distinct_counts due to this: https://lists.apache.org/thread/j52tsojv0x4bopxyzsp7m7bqt23n5fnd
             .lower_bounds(lower_bounds)
             .upper_bounds(upper_bounds)
+            .key_metadata(key_metadata)
             .split_offsets(Some(
                 metadata
                     .row_groups()
@@ -468,22 +561,19 @@ impl ParquetWriter {
                 upper_bounds.get(&field.source_id),
             ) {
                 if !field.transform.preserves_order() {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "cannot infer partition value for non linear partition field (needs to preserve order): {} with transform {}",
-                            field.name, field.transform
-                        ),
+                    return Err(invalid_data!(
+                        "cannot infer partition value for non linear partition field (needs to preserve order): {} with transform {}",
+                        field.name,
+                        field.transform
                     ));
                 }
 
                 if lower != upper {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "multiple partition values for field {}: lower: {:?}, upper: {:?}",
-                            field.name, lower, upper
-                        ),
+                    return Err(invalid_data!(
+                        "multiple partition values for field {}: lower: {:?}, upper: {:?}",
+                        field.name,
+                        lower,
+                        upper
                     ));
                 }
 
@@ -503,6 +593,40 @@ impl ParquetWriter {
     }
 }
 
+fn resolve_writer_properties(
+    writer_properties: WriterProperties,
+    key_metadata: Option<&StandardKeyMetadata>,
+) -> Result<WriterProperties> {
+    let Some(key_metadata) = key_metadata else {
+        return Ok(writer_properties);
+    };
+
+    if writer_properties.file_encryption_properties().is_some() {
+        return Err(Error::new(
+            ErrorKind::Unexpected,
+            "Parquet writer properties already have file encryption properties set",
+        ));
+    }
+
+    let mut builder =
+        FileEncryptionProperties::builder(key_metadata.encryption_key().as_bytes().to_vec());
+    if let Some(aad) = key_metadata.aad_prefix() {
+        builder = builder.with_aad_prefix(aad.to_vec());
+    }
+    let file_encryption_properties = builder.build().map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "Failed to build parquet file encryption properties",
+        )
+        .with_source(e)
+    })?;
+
+    Ok(writer_properties
+        .into_builder()
+        .with_file_encryption_properties(file_encryption_properties)
+        .build())
+}
+
 impl FileWriter for ParquetWriter {
     async fn write(&mut self, batch: &arrow_array::RecordBatch) -> Result<()> {
         // Skip empty batch
@@ -520,19 +644,15 @@ impl FileWriter for ParquetWriter {
         let writer = if let Some(writer) = &mut self.inner_writer {
             writer
         } else {
-            let arrow_schema: ArrowSchemaRef = {
-                let mut schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
-                // Embed the Iceberg schema JSON in the Arrow schema metadata so it
-                // is written into the Parquet `ARROW:schema` IPC section. Some
-                // downstream readers (e.g. Snowflake) expect the `iceberg.schema`
-                // key here in addition to the Parquet footer key-value metadata.
-                let iceberg_schema_json = serde_json::to_string(self.schema.as_ref())
-                    .expect("Iceberg schema serialization should not fail");
-                let mut metadata = schema.metadata.clone();
-                metadata.insert(ICEBERG_SCHEMA_KEY.to_string(), iceberg_schema_json);
-                schema.metadata = metadata;
-                Arc::new(schema)
-            };
+            let mut arrow_schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+            arrow_schema.metadata.insert(
+                ICEBERG_SCHEMA_KEY.to_string(),
+                serde_json::to_string(self.schema.as_ref()).map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, "Failed to serialize Iceberg schema")
+                        .with_source(e)
+                })?,
+            );
+            let arrow_schema: ArrowSchemaRef = Arc::new(arrow_schema);
             let inner_writer = self.output_file.writer().await?;
             let async_writer = AsyncFileWriter::new(inner_writer);
             let writer = AsyncArrowWriter::try_new(
@@ -589,6 +709,7 @@ impl FileWriter for ParquetWriter {
                 written_size,
                 self.output_file.location().to_string(),
                 self.nan_value_count_visitor.nan_value_counts,
+                self.key_metadata,
             )?])
         }
     }
@@ -641,9 +762,11 @@ impl ArrowAsyncFileWriter for AsyncFileWriter {
 
     fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
         Box::pin(async {
+            // TODO(encryption): retain the stored file size in data-file key metadata.
             self.0
                 .close()
                 .await
+                .map(|_| ())
                 .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))
         })
     }
@@ -663,16 +786,23 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
+    use futures::TryStreamExt;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
     use parquet::file::statistics::ValueStatistics;
+    use parquet::schema::types::ColumnPath;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
-    use crate::arrow::{UTC_TIME_ZONE, schema_to_arrow_schema};
+    use crate::Runtime;
+    use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
     use crate::io::FileIO;
+    use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::decimal_utils::{decimal_mantissa, decimal_new, decimal_scale};
     use crate::spec::{PrimitiveLiteral, Struct, *};
+    use crate::test_utils::make_encryption_manager;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
     };
@@ -905,6 +1035,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parquet_writer_encrypted_roundtrip() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let iceberg_schema: SchemaRef = Arc::new(arrow_schema.as_ref().try_into().unwrap());
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![
+            10, 20, 30,
+        ])) as ArrayRef])
+        .unwrap();
+
+        let output_file = file_io.new_output(
+            location_gen.generate_location(None, &file_name_gen.generate_file_name()),
+        )?;
+        let raw_properties = HashMap::from([(
+            TableProperties::PROPERTY_ENCRYPTION_KEY_ID.to_string(),
+            "test-key".to_string(),
+        )]);
+        let table_properties = TableProperties::new(&raw_properties);
+        let mut parquet_writer =
+            ParquetWriterBuilder::from_table_properties(&table_properties, iceberg_schema.clone())?
+                .with_encryption_manager(make_encryption_manager("test-key"))
+                .build(output_file)
+                .await?;
+        parquet_writer.write(&batch).await?;
+        let data_file = parquet_writer
+            .close()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let raw = file_io
+            .new_input(data_file.file_path.clone())?
+            .read()
+            .await?;
+        assert!(
+            ParquetRecordBatchReaderBuilder::try_new(raw).is_err(),
+            "an encrypted parquet file must not be readable without decryption"
+        );
+
+        let reader = ArrowReaderBuilder::new(file_io, Runtime::current()).build();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(data_file.file_size_in_bytes())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_file.file_path.clone())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema)
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .with_key_metadata(data_file.key_metadata().map(Box::from))
+            .build()
+            .unwrap();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches: Vec<RecordBatch> = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[10, 20, 30]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_parquet_writer_with_complex_schema() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
         let file_io = FileIO::new_with_fs();
@@ -936,11 +1156,11 @@ mod tests {
             (0..1024).map(|n| n.to_string()),
         )) as ArrayRef;
         let col3 = Arc::new({
-            let list_parts = arrow_array::ListArray::from_iter_primitive::<Int64Type, _, _>(
+            let list_parts = ListArray::from_iter_primitive::<Int64Type, _, _>(
                 (0..1024).map(|n| Some(vec![Some(n)])),
             )
             .into_parts();
-            arrow_array::ListArray::new(
+            ListArray::new(
                 {
                     if let DataType::List(field) = arrow_schema.field(3).data_type() {
                         field.clone()
@@ -1038,7 +1258,7 @@ mod tests {
                     nulls,
                 )
             };
-            arrow_array::MapArray::new(
+            MapArray::new(
                 {
                     if let DataType::Map(map_field, _) = arrow_schema.field(5).data_type() {
                         map_field.clone()
@@ -1073,7 +1293,7 @@ mod tests {
             .next()
             .unwrap()
             // Put dummy field for build successfully.
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1149,13 +1369,13 @@ mod tests {
         ])) as ArrayRef;
         let col1 = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)])) as ArrayRef;
         let col2 = Arc::new(Int64Array::from(vec![Some(1), Some(2), None, Some(4)])) as ArrayRef;
-        let col3 = Arc::new(arrow_array::Float32Array::from(vec![
+        let col3 = Arc::new(Float32Array::from(vec![
             Some(0.5),
             Some(2.0),
             None,
             Some(3.5),
         ])) as ArrayRef;
-        let col4 = Arc::new(arrow_array::Float64Array::from(vec![
+        let col4 = Arc::new(Float64Array::from(vec![
             Some(0.5),
             Some(2.0),
             None,
@@ -1193,7 +1413,7 @@ mod tests {
         ])) as ArrayRef;
         let col10 = Arc::new(
             arrow_array::TimestampMicrosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone(UTC_TIME_ZONE),
+                .with_timezone(crate::arrow::UTC_TIME_ZONE),
         ) as ArrayRef;
         let col11 = Arc::new(arrow_array::TimestampNanosecondArray::from(vec![
             Some(0),
@@ -1203,10 +1423,10 @@ mod tests {
         ])) as ArrayRef;
         let col12 = Arc::new(
             arrow_array::TimestampNanosecondArray::from(vec![Some(0), Some(1), None, Some(3)])
-                .with_timezone(UTC_TIME_ZONE),
+                .with_timezone(crate::arrow::UTC_TIME_ZONE),
         ) as ArrayRef;
         let col13 = Arc::new(
-            arrow_array::Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
+            Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
                 .with_precision_and_scale(10, 5)
                 .unwrap(),
         ) as ArrayRef;
@@ -1237,7 +1457,7 @@ mod tests {
             .unwrap(),
         ) as ArrayRef;
         let col16 = Arc::new(
-            arrow_array::Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
+            Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
                 .with_precision_and_scale(38, 5)
                 .unwrap(),
         ) as ArrayRef;
@@ -1263,7 +1483,7 @@ mod tests {
             .next()
             .unwrap()
             // Put dummy field for build successfully.
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1284,7 +1504,7 @@ mod tests {
                 (0, Datum::bool(false)),
                 (1, Datum::int(1)),
                 (2, Datum::long(1)),
-                (3, Datum::float(0.5)),
+                (3, Datum::float(0.5_f32)),
                 (4, Datum::double(0.5)),
                 (5, Datum::string("a")),
                 (6, Datum::binary(vec![])),
@@ -1324,7 +1544,7 @@ mod tests {
                 (0, Datum::bool(true)),
                 (1, Datum::int(4)),
                 (2, Datum::long(4)),
-                (3, Datum::float(3.5)),
+                (3, Datum::float(3.5_f32)),
                 (4, Datum::double(3.5)),
                 (5, Datum::string("d")),
                 (6, Datum::binary(vec![122, 122, 122, 122])),
@@ -1414,7 +1634,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1466,7 +1686,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1527,7 +1747,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1625,11 +1845,13 @@ mod tests {
 
         // Test that file will create if data to write
         let schema = {
-            let fields = vec![
-                arrow_schema::Field::new("col", arrow_schema::DataType::Int64, true).with_metadata(
-                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "0".to_string())]),
-                ),
-            ];
+            let fields =
+                vec![
+                    Field::new("col", DataType::Int64, true).with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        "0".to_string(),
+                    )])),
+                ];
             Arc::new(arrow_schema::Schema::new(fields))
         };
         let col = Arc::new(Int64Array::from_iter_values(0..1024)) as ArrayRef;
@@ -1676,12 +1898,14 @@ mod tests {
         // prepare data
         let arrow_schema = {
             let fields = vec![
-                Field::new("col", arrow_schema::DataType::Float32, false).with_metadata(
-                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "0".to_string())]),
-                ),
-                Field::new("col2", arrow_schema::DataType::Float64, false).with_metadata(
-                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-                ),
+                Field::new("col", DataType::Float32, false).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "0".to_string(),
+                )])),
+                Field::new("col2", DataType::Float64, false).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
             ];
             Arc::new(arrow_schema::Schema::new(fields))
         };
@@ -1718,7 +1942,7 @@ mod tests {
             .next()
             .unwrap()
             // Put dummy field for build successfully.
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1729,11 +1953,11 @@ mod tests {
         assert_eq!(*data_file.value_counts(), HashMap::from([(0, 4), (1, 4)]));
         assert_eq!(
             *data_file.lower_bounds(),
-            HashMap::from([(0, Datum::float(1.0)), (1, Datum::double(1.0)),])
+            HashMap::from([(0, Datum::float(1.0_f32)), (1, Datum::double(1.0)),])
         );
         assert_eq!(
             *data_file.upper_bounds(),
-            HashMap::from([(0, Datum::float(2.0)), (1, Datum::double(2.0)),])
+            HashMap::from([(0, Datum::float(2.0_f32)), (1, Datum::double(2.0)),])
         );
         assert_eq!(
             *data_file.null_value_counts(),
@@ -1778,7 +2002,7 @@ mod tests {
         let schema_struct_nested_fields = Fields::from(vec![
             Field::new(
                 "col6",
-                arrow_schema::DataType::Struct(schema_struct_nested_float_fields.clone()),
+                DataType::Struct(schema_struct_nested_float_fields.clone()),
                 false,
             )
             .with_metadata(HashMap::from([(
@@ -1792,7 +2016,7 @@ mod tests {
             let fields = vec![
                 Field::new(
                     "col3",
-                    arrow_schema::DataType::Struct(schema_struct_float_fields.clone()),
+                    DataType::Struct(schema_struct_float_fields.clone()),
                     false,
                 )
                 .with_metadata(HashMap::from([(
@@ -1801,7 +2025,7 @@ mod tests {
                 )])),
                 Field::new(
                     "col5",
-                    arrow_schema::DataType::Struct(schema_struct_nested_fields.clone()),
+                    DataType::Struct(schema_struct_nested_fields.clone()),
                     false,
                 )
                 .with_metadata(HashMap::from([(
@@ -1858,7 +2082,7 @@ mod tests {
             .next()
             .unwrap()
             // Put dummy field for build successfully.
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -1869,11 +2093,11 @@ mod tests {
         assert_eq!(*data_file.value_counts(), HashMap::from([(4, 4), (7, 4)]));
         assert_eq!(
             *data_file.lower_bounds(),
-            HashMap::from([(4, Datum::float(1.0)), (7, Datum::float(1.0)),])
+            HashMap::from([(4, Datum::float(1.0_f32)), (7, Datum::float(1.0_f32)),])
         );
         assert_eq!(
             *data_file.upper_bounds(),
-            HashMap::from([(4, Datum::float(2.0)), (7, Datum::float(2.0)),])
+            HashMap::from([(4, Datum::float(2.0_f32)), (7, Datum::float(2.0_f32)),])
         );
         assert_eq!(
             *data_file.null_value_counts(),
@@ -2022,7 +2246,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -2033,11 +2257,11 @@ mod tests {
         assert_eq!(*data_file.value_counts(), HashMap::from([(1, 4), (4, 4)]));
         assert_eq!(
             *data_file.lower_bounds(),
-            HashMap::from([(1, Datum::float(1.0)), (4, Datum::float(1.0))])
+            HashMap::from([(1, Datum::float(1.0_f32)), (4, Datum::float(1.0_f32))])
         );
         assert_eq!(
             *data_file.upper_bounds(),
-            HashMap::from([(1, Datum::float(2.0)), (4, Datum::float(2.0))])
+            HashMap::from([(1, Datum::float(2.0_f32)), (4, Datum::float(2.0_f32))])
         );
         assert_eq!(
             *data_file.null_value_counts(),
@@ -2203,7 +2427,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
-            .content(crate::spec::DataContentType::Data)
+            .content(DataContentType::Data)
             .partition(Struct::empty())
             .partition_spec_id(0)
             .build()
@@ -2219,18 +2443,18 @@ mod tests {
             *data_file.lower_bounds(),
             HashMap::from([
                 (1, Datum::int(1)),
-                (2, Datum::float(1.0)),
+                (2, Datum::float(1.0_f32)),
                 (6, Datum::int(1)),
-                (7, Datum::float(1.0))
+                (7, Datum::float(1.0_f32))
             ])
         );
         assert_eq!(
             *data_file.upper_bounds(),
             HashMap::from([
                 (1, Datum::int(4)),
-                (2, Datum::float(2.0)),
+                (2, Datum::float(2.0_f32)),
                 (6, Datum::int(4)),
-                (7, Datum::float(2.0))
+                (7, Datum::float(2.0_f32))
             ])
         );
         assert_eq!(
@@ -2288,6 +2512,79 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
     }
 
+    #[tokio::test]
+    async fn test_parquet_writer_uuid_logical_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let output_file = file_io
+            .new_output(location_gen.generate_location(None, &file_name_gen.generate_file_name()))
+            .unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let col = Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_iter(
+                [Uuid::from_u128(0), Uuid::from_u128(1)]
+                    .into_iter()
+                    .map(|uuid| uuid.into_bytes()),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema, vec![col]).unwrap();
+
+        let mut pw = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+            .build(output_file)
+            .await
+            .unwrap();
+        pw.write(&to_write).await.unwrap();
+        let data_file = pw
+            .close()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+
+        let raw = file_io
+            .new_input(data_file.file_path.clone())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(raw).unwrap();
+        let column = reader.metadata().file_metadata().schema_descr().column(0);
+        assert_eq!(
+            (
+                column.physical_type(),
+                column.type_length(),
+                column.logical_type_ref()
+            ),
+            (
+                parquet::basic::Type::FIXED_LEN_BYTE_ARRAY,
+                16,
+                Some(&parquet::basic::LogicalType::Uuid)
+            )
+        );
+    }
+
     #[test]
     fn test_min_max_aggregator() {
         let schema = Arc::new(
@@ -2305,16 +2602,16 @@ mod tests {
         let create_statistics =
             |min, max| Statistics::Int32(ValueStatistics::new(min, max, None, None, false));
         min_max_agg
-            .update(0, create_statistics(None, Some(42)))
+            .update(0, &create_statistics(None, Some(42)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(0), Some(i32::MAX)))
+            .update(0, &create_statistics(Some(0), Some(i32::MAX)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(i32::MIN), None))
+            .update(0, &create_statistics(Some(i32::MIN), None))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(None, None))
+            .update(0, &create_statistics(None, None))
             .unwrap();
 
         let (lower_bounds, upper_bounds) = min_max_agg.produce();
@@ -2323,11 +2620,283 @@ mod tests {
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
     }
 
+    #[test]
+    fn test_min_max_aggregator_skips_nan_bounds() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(0, "f", Type::Primitive(PrimitiveType::Float)).into(),
+                    NestedField::required(1, "d", Type::Primitive(PrimitiveType::Double)).into(),
+                ])
+                .build()
+                .expect("Failed to create schema"),
+        );
+        let mut min_max_agg = MinMaxColAggregator::new(schema);
+        let float_stats =
+            |min, max| Statistics::Float(ValueStatistics::new(min, max, None, None, false));
+        let double_stats =
+            |min, max| Statistics::Double(ValueStatistics::new(min, max, None, None, false));
+
+        min_max_agg
+            .update(0, &float_stats(Some(-f32::NAN), Some(f32::NAN)))
+            .unwrap();
+        min_max_agg
+            .update(0, &float_stats(Some(1.5), Some(2.5)))
+            .unwrap();
+        min_max_agg
+            .update(1, &double_stats(Some(f64::NAN), Some(f64::NAN)))
+            .unwrap();
+
+        let (lower_bounds, upper_bounds) = min_max_agg.produce();
+
+        assert_eq!(lower_bounds, HashMap::from([(0, Datum::float(1.5_f32))]));
+        assert_eq!(upper_bounds, HashMap::from([(0, Datum::float(2.5_f32))]));
+    }
+
+    fn cdc_test_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::required(2, "payload", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_from_table_properties_no_cdc_by_default() {
+        let raw_properties = HashMap::new();
+        let tp = TableProperties::new(&raw_properties);
+        let builder = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema()).unwrap();
+        assert!(builder.props.content_defined_chunking().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_table_properties_without_encryption_writes_plaintext() {
+        let raw_properties = HashMap::new();
+        let tp = TableProperties::new(&raw_properties);
+        let tmp = TempDir::new().unwrap();
+        let output = FileIO::new_with_fs()
+            .new_output(format!("{}/plain.parquet", tmp.path().to_str().unwrap()))
+            .unwrap();
+        let writer = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
+            .unwrap()
+            .build(output)
+            .await
+            .unwrap();
+
+        assert!(writer.key_metadata.is_none());
+        assert!(
+            writer
+                .writer_properties
+                .file_encryption_properties()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_table_properties_propagate_to_writer() {
+        // `build()` must carry the translated `WriterProperties` through to the
+        // `ParquetWriter` unchanged — otherwise the `write.parquet.*` settings
+        // derived in `from_table_properties` would never reach parquet-rs.
+        //
+        // Asserting on the writer's `WriterProperties` (rather than re-reading a
+        // written file) keeps this a direct propagation check: every future
+        // `write.parquet.*` option just adds an assertion on its corresponding
+        // `WriterProperties` getter here.
+        let raw_properties = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
+                "4096".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE.to_string(),
+                "8192".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "2".to_string(),
+            ),
+        ]);
+        let tp = TableProperties::new(&raw_properties);
+
+        let tmp = TempDir::new().unwrap();
+        let output = FileIO::new_with_fs()
+            .new_output(format!("{}/cdc.parquet", tmp.path().to_str().unwrap()))
+            .unwrap();
+        let writer = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
+            .unwrap()
+            .build(output)
+            .await
+            .unwrap();
+
+        let cdc = writer
+            .writer_properties
+            .content_defined_chunking()
+            .copied()
+            .expect("CDC should be enabled on the built writer");
+        assert_eq!(cdc.min_chunk_size, 4096);
+        assert_eq!(cdc.max_chunk_size, 8192);
+        assert_eq!(cdc.norm_level, 2);
+    }
+
+    #[test]
+    fn test_from_table_properties_sizing_defaults() {
+        // With no properties set, the writer must use Iceberg's defaults (which
+        // differ from parquet-rs's own defaults), not parquet-rs's.
+        let raw_properties = HashMap::new();
+        let tp = TableProperties::new(&raw_properties);
+        let props = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
+            .unwrap()
+            .props;
+
+        assert_eq!(
+            props.max_row_group_bytes(),
+            Some(TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT)
+        );
+        assert_eq!(
+            props.data_page_size_limit(),
+            TableProperties::PROPERTY_PARQUET_PAGE_SIZE_BYTES_DEFAULT
+        );
+        assert_eq!(
+            props.data_page_row_count_limit(),
+            TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT_DEFAULT
+        );
+        assert_eq!(
+            props.dictionary_page_size_limit(),
+            TableProperties::PROPERTY_PARQUET_DICT_SIZE_BYTES_DEFAULT
+        );
+        // Default codec is zstd at the Java-aligned default level (3).
+        assert_eq!(
+            props.compression(&ColumnPath::from("id")),
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_from_table_properties_sizing_and_compression_overrides() {
+        let raw_properties = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_string(),
+                "1048576".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_PAGE_SIZE_BYTES.to_string(),
+                "65536".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT.to_string(),
+                "5000".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_DICT_SIZE_BYTES.to_string(),
+                "131072".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC.to_string(),
+                "gzip".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL.to_string(),
+                "9".to_string(),
+            ),
+        ]);
+        let tp = TableProperties::new(&raw_properties);
+        let props = ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
+            .unwrap()
+            .props;
+
+        assert_eq!(props.max_row_group_bytes(), Some(1048576));
+        assert_eq!(props.data_page_size_limit(), 65536);
+        assert_eq!(props.data_page_row_count_limit(), 5000);
+        assert_eq!(props.dictionary_page_size_limit(), 131072);
+        assert_eq!(
+            props.compression(&ColumnPath::from("id")),
+            Compression::GZIP(GzipLevel::try_new(9).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_from_table_properties_invalid_codec_errors() {
+        let entries = HashMap::from([(
+            TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC.to_string(),
+            "bogus".to_string(),
+        )]);
+        let err = ParquetWriterBuilder::from_table_properties(
+            &TableProperties::new(&entries),
+            cdc_test_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn test_parquet_compression_mapping() {
+        // Codecs without a level.
+        assert_eq!(
+            parquet_compression(CompressionCodec::None).unwrap(),
+            Compression::UNCOMPRESSED
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::Snappy).unwrap(),
+            Compression::SNAPPY
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::Lz4).unwrap(),
+            Compression::LZ4
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::Lz4Raw).unwrap(),
+            Compression::LZ4_RAW
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::Lzo).unwrap(),
+            Compression::LZO
+        );
+
+        // Level-carrying codecs at their defaults.
+        assert_eq!(
+            parquet_compression(CompressionCodec::zstd_default()).unwrap(),
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap())
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::gzip_default()).unwrap(),
+            Compression::GZIP(GzipLevel::try_new(6).unwrap())
+        );
+        assert_eq!(
+            parquet_compression(CompressionCodec::brotli_default()).unwrap(),
+            Compression::BROTLI(BrotliLevel::try_new(1).unwrap())
+        );
+
+        // Explicit levels are honored.
+        assert_eq!(
+            parquet_compression(CompressionCodec::Zstd(10)).unwrap(),
+            Compression::ZSTD(ZstdLevel::try_new(10).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parquet_compression_invalid_level() {
+        // zstd valid range is 1..=22; 99 is out of range.
+        let err = parquet_compression(CompressionCodec::Zstd(99)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.to_string().contains("zstd"));
+    }
     /// Helper to read the Parquet file footer key-value metadata from a written data file.
     async fn read_parquet_kv_metadata(
         file_io: &FileIO,
         data_file: &DataFile,
-    ) -> Option<Vec<parquet::file::metadata::KeyValue>> {
+    ) -> Option<Vec<KeyValue>> {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let input_file = file_io.new_input(data_file.file_path.clone()).unwrap();
@@ -2627,7 +3196,7 @@ mod tests {
     #[tokio::test]
     async fn test_iceberg_schema_preserves_existing_kv_metadata() -> Result<()> {
         let props = WriterProperties::builder()
-            .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            .set_key_value_metadata(Some(vec![KeyValue::new(
                 "custom.key".to_string(),
                 "custom_value".to_string(),
             )]))
@@ -2654,6 +3223,91 @@ mod tests {
             "iceberg.schema must be present alongside custom metadata"
         );
 
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_variant_write_scan_roundtrip() -> Result<()> {
+        use futures::TryStreamExt;
+
+        use crate::table::Table;
+        use crate::test_utils::test_runtime;
+        use crate::transaction::Transaction;
+        use crate::transaction::tests::{commit_action, first_snapshot, table_with_snapshot};
+
+        let dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "payload", Type::Variant(VariantType)).into(),
+                ])
+                .build()?,
+        );
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema)?);
+        let DataType::Struct(fields) = arrow_schema.field(1).data_type() else {
+            unreachable!()
+        };
+        let payload = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(arrow_array::BinaryArray::from(vec![&[1u8, 0, 0][..]])),
+                Arc::new(arrow_array::BinaryArray::from(vec![&[0u8][..]])),
+            ],
+            None,
+        )) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int64Array::from(vec![7])),
+            payload,
+        ])?;
+        let location = dir.path().to_str().unwrap().to_string();
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone())
+                .build(file_io.new_output(format!("{location}/data.parquet"))?)
+                .await?;
+        writer.write(&batch).await?;
+        let file = writer
+            .close()
+            .await?
+            .remove(0)
+            .content(DataContentType::Data)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            location,
+            FormatVersion::V3,
+            HashMap::new(),
+        )?
+        .build()?
+        .metadata;
+        let table = Table::builder()
+            .metadata(metadata)
+            .identifier(crate::TableIdent::from_strs(["ns", "variant"])?)
+            .file_io(file_io)
+            .runtime(test_runtime())
+            .build()?;
+        let mut commit = commit_action(
+            Transaction::new(&table)
+                .fast_append()
+                .add_data_files([file]),
+            &table,
+        )
+        .await?;
+        let table = table_with_snapshot(&table, first_snapshot(commit.take_updates()));
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .build()?
+            .to_arrow()
+            .await?
+            .try_collect()
+            .await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].columns(), batch.columns());
         Ok(())
     }
 }

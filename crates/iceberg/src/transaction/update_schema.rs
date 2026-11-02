@@ -22,24 +22,22 @@ use async_trait::async_trait;
 use typed_builder::TypedBuilder;
 
 use crate::spec::{
-    ListType, Literal, MapType, NestedField, NestedFieldRef, Schema, StructType, Type,
+    ListType, Literal, MapType, NestedField, NestedFieldRef, SCHEMA_NAME_DELIMITER, Schema,
+    StructType, Type,
 };
 use crate::table::Table;
-use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::transaction::action::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
-/// Sentinel parent ID representing the table root (top-level columns).
-const TABLE_ROOT_ID: i32 = -1;
 // Default ID for a new column. This will be re-assigned to a fresh ID at commit time.
-const DEFAULT_ID: i32 = 0;
+const DEFAULT_FIELD_ID: i32 = 0;
 
-#[derive(TypedBuilder)]
-/// Declarative specification for adding a column in [`UpdateSchemaAction`].
+/// Declarative specification for adding a column in an [`UpdateSchemaAction`].
 ///
 /// Use helper constructors such as [`AddColumn::optional`] and [`AddColumn::required`],
-/// optionally combined with [`AddColumn::with_parent`] and [`AddColumn::with_doc`], then pass
-/// the value to
-/// [`UpdateSchemaAction::add_column`].
+/// optionally combined with the builder's `parent` and `doc` setters via
+/// [`AddColumn::builder`], then pass the value to [`UpdateSchemaAction::add_column`].
+#[derive(Clone, TypedBuilder)]
 pub struct AddColumn {
     #[builder(default = None, setter(strip_option, into))]
     parent: Option<String>,
@@ -77,13 +75,13 @@ impl AddColumn {
             .build()
     }
 
-    /// Return a copy with an updated parent path.
+    /// Sets the parent path for a nested column.
     pub fn with_parent(mut self, parent: impl ToString) -> Self {
         self.parent = Some(parent.to_string());
         self
     }
 
-    /// Return a copy with an updated doc string.
+    /// Sets the column documentation.
     pub fn with_doc(mut self, doc: impl ToString) -> Self {
         self.doc = Some(doc.to_string());
         self
@@ -91,7 +89,7 @@ impl AddColumn {
 
     fn to_nested_field(&self) -> NestedFieldRef {
         let mut field = NestedField::new(
-            DEFAULT_ID,
+            DEFAULT_FIELD_ID,
             self.name.clone(),
             self.field_type.clone(),
             self.required,
@@ -126,6 +124,7 @@ impl AddColumn {
 /// let tx = action.apply(tx).unwrap();
 /// let table = tx.commit(&catalog).await.unwrap();
 /// ```
+#[derive(Clone)]
 pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
@@ -147,7 +146,7 @@ impl UpdateSchemaAction {
     /// Add a column to the table schema.
     ///
     /// To add a root-level column, leave `AddColumn::parent` as `None`.
-    /// For nested additions, set a parent path (for example via [`AddColumn::with_parent`]).
+    /// For nested additions, set a parent path.
     /// If the parent resolves to a map/list, the column is added to map value/list element.
     pub fn add_column(mut self, add_column: AddColumn) -> Self {
         self.additions.push(add_column);
@@ -156,6 +155,12 @@ impl UpdateSchemaAction {
 
     // --- Other builder methods ---
 
+    /// Uses caller-provided field IDs instead of assigning fresh IDs.
+    pub fn disable_id_auto_assignment(mut self) -> Self {
+        self.auto_assign_ids = false;
+        self
+    }
+
     /// Record a column deletion by name.
     ///
     /// At commit time, the column must exist in the current schema.
@@ -163,15 +168,6 @@ impl UpdateSchemaAction {
         self.deletes.push(name.to_string());
         self
     }
-
-    /// Disable automatic field ID assignment. When disabled, the placeholder IDs
-    /// provided in builder methods are used as-is.
-    pub fn disable_id_auto_assignment(mut self) -> Self {
-        self.auto_assign_ids = false;
-        self
-    }
-
-    // --- Internal helpers ---
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +180,7 @@ impl UpdateSchemaAction {
 /// from `crate::spec::schema::id_reassigner`, but operates on new fields with placeholder
 /// IDs rather than reassigning an existing schema. `ReassignFieldIds` cannot be used
 /// directly here because it rejects duplicate old IDs (all new fields share placeholder
-/// ID `DEFAULT_ID`).
+/// ID `DEFAULT_FIELD_ID`).
 fn assign_fresh_ids(field: &NestedField, next_id: &mut i32) -> NestedFieldRef {
     *next_id += 1;
     let new_id = *next_id;
@@ -204,7 +200,10 @@ fn assign_fresh_ids(field: &NestedField, next_id: &mut i32) -> NestedFieldRef {
 /// Recursively assign fresh field IDs to all nested fields within a `Type`.
 fn assign_fresh_ids_to_type(field_type: &Type, next_id: &mut i32) -> Type {
     match field_type {
-        Type::Primitive(_) | Type::Variant(_) => field_type.clone(),
+        Type::Primitive(_) => field_type.clone(),
+        // Variant carries no nested fields, so there is nothing to reassign
+        // (matches id_reassigner.rs).
+        Type::Variant(v) => Type::Variant(*v),
         Type::Struct(struct_type) => {
             let new_fields: Vec<NestedFieldRef> = struct_type
                 .fields()
@@ -279,18 +278,18 @@ fn resolve_parent_target<'a>(
 // ---------------------------------------------------------------------------
 
 /// Rebuild a slice of fields, applying deletions and additions at every level,
-/// plus any root-level additions keyed by `TABLE_ROOT_ID`.
+/// plus any additions keyed by `parent_id` (`None` represents the table root).
 fn rebuild_fields(
     fields: &[NestedFieldRef],
-    adds: &HashMap<i32, Vec<NestedFieldRef>>,
+    adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
-    root_id: i32,
+    parent_id: Option<i32>,
 ) -> Vec<NestedFieldRef> {
     fields
         .iter()
         .filter(|f| !delete_ids.contains(&f.id))
         .map(|f| rebuild_field(f, adds, delete_ids))
-        .chain(adds.get(&root_id).into_iter().flatten().cloned())
+        .chain(adds.get(&parent_id).into_iter().flatten().cloned())
         .collect()
 }
 
@@ -299,13 +298,13 @@ fn rebuild_fields(
 /// Fields whose IDs appear in `delete_ids` are filtered out at every struct level.
 fn rebuild_field(
     field: &NestedFieldRef,
-    adds: &HashMap<i32, Vec<NestedFieldRef>>,
+    adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
 ) -> NestedFieldRef {
     match field.field_type.as_ref() {
         Type::Primitive(_) | Type::Variant(_) => field.clone(),
         Type::Struct(s) => {
-            let new_fields = rebuild_fields(s.fields(), adds, delete_ids, field.id);
+            let new_fields = rebuild_fields(s.fields(), adds, delete_ids, Some(field.id));
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
@@ -350,12 +349,12 @@ fn rebuild_field(
 }
 
 // ---------------------------------------------------------------------------
-// TransactionAction implementation
+// StatelessAction implementation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl TransactionAction for UpdateSchemaAction {
-    async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for UpdateSchemaAction {
+    async fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let base_schema = table.metadata().current_schema();
         let mut last_column_id = table.metadata().last_column_id();
 
@@ -390,13 +389,13 @@ impl TransactionAction for UpdateSchemaAction {
         // --- 2. Resolve parents, validate additions, assign IDs, and group by parent ID ---
         // We assign IDs inline (before grouping) to preserve the caller's insertion order,
         // since HashMap iteration order is non-deterministic.
-        let mut additions_by_parent: HashMap<i32, Vec<NestedFieldRef>> = HashMap::new();
+        let mut additions_by_parent: HashMap<Option<i32>, Vec<NestedFieldRef>> = HashMap::new();
 
         for add in &self.additions {
             let pending_field = add.to_nested_field();
 
-            // Check that name does not contain ".".
-            if pending_field.name.contains('.') {
+            // Check that name does not contain `SCHEMA_NAME_DELIMITER`.
+            if pending_field.name.contains(SCHEMA_NAME_DELIMITER) {
                 return Err(Error::new(
                     ErrorKind::PreconditionFailed,
                     format!(
@@ -431,17 +430,17 @@ impl TransactionAction for UpdateSchemaAction {
                             ),
                         ));
                     }
-                    TABLE_ROOT_ID
+                    None
                 }
                 Some(parent_path) => {
                     // Nested: resolve parent, check name conflict within parent struct.
-                    let (parent_id, parent_struct) =
+                    let (resolved_parent_id, parent_struct) =
                         resolve_parent_target(base_schema, parent_path)?;
 
                     if parent_struct.fields().iter().any(|f| {
                         f.name == pending_field.name
                             && !delete_ids.contains(&f.id)
-                            && !delete_ids.contains(&parent_id)
+                            && !delete_ids.contains(&resolved_parent_id)
                     }) {
                         return Err(Error::new(
                             ErrorKind::PreconditionFailed,
@@ -452,7 +451,7 @@ impl TransactionAction for UpdateSchemaAction {
                         ));
                     }
 
-                    parent_id
+                    Some(resolved_parent_id)
                 }
             };
 
@@ -474,7 +473,7 @@ impl TransactionAction for UpdateSchemaAction {
             base_schema.as_struct().fields(),
             &additions_by_parent,
             &delete_ids,
-            TABLE_ROOT_ID,
+            None,
         );
 
         // --- 5. Build the new schema ---
@@ -499,16 +498,19 @@ impl TransactionAction for UpdateSchemaAction {
 #[cfg(test)]
 mod tests {
     use std::io::BufReader;
-    use std::sync::Arc;
 
     use as_any::Downcast;
 
-    use crate::spec::{Literal, NestedField, PrimitiveType, StructType, TableMetadata, Type};
+    use crate::spec::{
+        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, StructType, TableMetadata, Type,
+        VariantType,
+    };
     use crate::table::Table;
+    use crate::test_utils::commit_with_fresh_state;
     use crate::transaction::Transaction;
-    use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
+    use crate::transaction::action::{ActionEntry, ApplyTransactionAction};
     use crate::transaction::tests::make_v2_table;
-    use crate::transaction::update_schema::{AddColumn, DEFAULT_ID, UpdateSchemaAction};
+    use crate::transaction::update_schema::{AddColumn, DEFAULT_FIELD_ID, UpdateSchemaAction};
     use crate::{ErrorKind, TableIdent, TableRequirement, TableUpdate};
 
     // The V2 test table has:
@@ -609,6 +611,7 @@ mod tests {
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(crate::io::FileIO::new_with_memory())
+            .runtime(crate::test_utils::test_runtime())
             .build()
             .unwrap()
     }
@@ -616,6 +619,19 @@ mod tests {
     // -----------------------------------------------------------------------
     // Existing root-level tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assign_fresh_ids_variant() {
+        // Variant carries no sub-fields, so fresh-id assignment only renames the field
+        // itself and leaves the type untouched.
+        let mut next_id = 10;
+        let field = NestedField::optional(1, "data", Type::Variant(VariantType));
+        let assigned = super::assign_fresh_ids(&field, &mut next_id);
+
+        assert_eq!(assigned.id, 11);
+        assert_eq!(*assigned.field_type, Type::Variant(VariantType));
+        assert_eq!(next_id, 11);
+    }
 
     #[tokio::test]
     async fn test_add_column() {
@@ -627,7 +643,7 @@ mod tests {
             Type::Primitive(PrimitiveType::Int),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 
@@ -639,19 +655,19 @@ mod tests {
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
-        // The new field should have ID = last_column_id + 1 = 4.
-        let new_field = new_schema
-            .field_by_name("new_col")
-            .expect("new_col should exist");
-        assert_eq!(new_field.id, 4);
-        assert!(!new_field.required);
-        assert_eq!(*new_field.field_type, Type::Primitive(PrimitiveType::Int));
-        assert!(new_field.doc.is_none());
-
-        // Original fields should still be there.
-        assert!(new_schema.field_by_name("x").is_some());
-        assert!(new_schema.field_by_name("y").is_some());
-        assert!(new_schema.field_by_name("z").is_some());
+        let expected_schema = table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .clone()
+            .into_builder()
+            .with_schema_id(DEFAULT_SCHEMA_ID)
+            .with_fields([
+                NestedField::optional(4, "new_col", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        assert_eq!(new_schema, &expected_schema);
 
         assert_eq!(updates[1], TableUpdate::SetCurrentSchema { schema_id: -1 });
 
@@ -668,11 +684,14 @@ mod tests {
         let tx = Transaction::new(&table);
 
         let action = tx.update_schema().add_column(
-            AddColumn::optional("documented_col", Type::Primitive(PrimitiveType::String))
-                .with_doc("A documented column"),
+            AddColumn::builder()
+                .name("documented_col")
+                .field_type(Type::Primitive(PrimitiveType::String))
+                .doc("A documented column")
+                .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -699,7 +718,7 @@ mod tests {
             Literal::int(0),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -727,7 +746,7 @@ mod tests {
             Type::Primitive(PrimitiveType::Int),
         ));
 
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_with_fresh_state(action, &table).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("should reject adding a column with an existing name"),
@@ -748,7 +767,7 @@ mod tests {
         // z is not an identifier field, so we can delete it.
         let action = tx.update_schema().delete_column("z");
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -771,7 +790,7 @@ mod tests {
 
         let action = tx.update_schema().delete_column("nonexistent");
 
-        let result = Arc::new(action).commit(&table).await;
+        let result = commit_with_fresh_state(action, &table).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("should reject deleting a non-existent column"),
@@ -798,7 +817,7 @@ mod tests {
                 Type::Primitive(PrimitiveType::Boolean),
             ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -829,7 +848,7 @@ mod tests {
                 Type::Primitive(PrimitiveType::Boolean),
             ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -860,7 +879,7 @@ mod tests {
 
         assert_eq!(tx.actions.len(), 1);
         (*tx.actions[0])
-            .downcast_ref::<UpdateSchemaAction>()
+            .downcast_ref::<ActionEntry<UpdateSchemaAction>>()
             .expect("UpdateSchemaAction was not applied to Transaction!");
     }
 
@@ -875,11 +894,14 @@ mod tests {
 
         // Add "email" to the "person" struct.
         let action = tx.update_schema().add_column(
-            AddColumn::optional("email", Type::Primitive(PrimitiveType::String))
-                .with_parent("person"),
+            AddColumn::builder()
+                .name("email")
+                .field_type(Type::Primitive(PrimitiveType::String))
+                .parent("person")
+                .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -906,12 +928,15 @@ mod tests {
         let tx = Transaction::new(&table);
 
         let action = tx.update_schema().add_column(
-            AddColumn::optional("phone", Type::Primitive(PrimitiveType::String))
-                .with_parent("person")
-                .with_doc("Phone number"),
+            AddColumn::builder()
+                .name("phone")
+                .field_type(Type::Primitive(PrimitiveType::String))
+                .parent("person")
+                .doc("Phone number")
+                .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -934,11 +959,14 @@ mod tests {
         // "tags" is a list<struct{key, value}>. Adding to the list navigates to its
         // element struct automatically.
         let action = tx.update_schema().add_column(
-            AddColumn::optional("score", Type::Primitive(PrimitiveType::Double))
-                .with_parent("tags"),
+            AddColumn::builder()
+                .name("score")
+                .field_type(Type::Primitive(PrimitiveType::Double))
+                .parent("tags")
+                .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -966,11 +994,14 @@ mod tests {
         // "props" is a map<string, struct{data}>. Adding to the map navigates to its
         // value struct automatically.
         let action = tx.update_schema().add_column(
-            AddColumn::optional("version", Type::Primitive(PrimitiveType::Int))
-                .with_parent("props"),
+            AddColumn::builder()
+                .name("version")
+                .field_type(Type::Primitive(PrimitiveType::Int))
+                .parent("props")
+                .build(),
         );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -993,11 +1024,14 @@ mod tests {
         let tx = Transaction::new(&table);
 
         let action = tx.update_schema().add_column(
-            AddColumn::optional("col", Type::Primitive(PrimitiveType::Int))
-                .with_parent("nonexistent"),
+            AddColumn::builder()
+                .name("col")
+                .field_type(Type::Primitive(PrimitiveType::Int))
+                .parent("nonexistent")
+                .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match commit_with_fresh_state(action, &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding to a nonexistent parent"),
         };
@@ -1016,10 +1050,14 @@ mod tests {
 
         // "x" is a primitive (long), not a struct.
         let action = tx.update_schema().add_column(
-            AddColumn::optional("col", Type::Primitive(PrimitiveType::Int)).with_parent("x"),
+            AddColumn::builder()
+                .name("col")
+                .field_type(Type::Primitive(PrimitiveType::Int))
+                .parent("x")
+                .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match commit_with_fresh_state(action, &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding to a primitive parent"),
         };
@@ -1038,11 +1076,14 @@ mod tests {
 
         // "name" already exists in the "person" struct.
         let action = tx.update_schema().add_column(
-            AddColumn::optional("name", Type::Primitive(PrimitiveType::String))
-                .with_parent("person"),
+            AddColumn::builder()
+                .name("name")
+                .field_type(Type::Primitive(PrimitiveType::String))
+                .parent("person")
+                .build(),
         );
 
-        let err = match Arc::new(action).commit(&table).await {
+        let err = match commit_with_fresh_state(action, &table).await {
             Err(e) => e,
             Ok(_) => panic!("should reject adding a column with conflicting name"),
         };
@@ -1067,11 +1108,14 @@ mod tests {
                 Type::Primitive(PrimitiveType::Boolean),
             ))
             .add_column(
-                AddColumn::optional("email", Type::Primitive(PrimitiveType::String))
-                    .with_parent("person"),
+                AddColumn::builder()
+                    .name("email")
+                    .field_type(Type::Primitive(PrimitiveType::String))
+                    .parent("person")
+                    .build(),
             );
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
@@ -1095,21 +1139,29 @@ mod tests {
     #[tokio::test]
     async fn test_add_nested_struct_type_with_fresh_ids() {
         // Adding a new column whose TYPE contains nested fields (e.g. a struct column). All sub-fields must receive
-        // fresh IDs, not placeholder `DEFAULT_ID`.
+        // fresh IDs, not placeholder `DEFAULT_FIELD_ID`.
         let table = make_v2_table();
         let tx = Transaction::new(&table);
 
         let action = tx.update_schema().add_column(AddColumn::optional(
             "address",
             Type::Struct(StructType::new(vec![
-                NestedField::optional(DEFAULT_ID, "street", Type::Primitive(PrimitiveType::String))
-                    .into(),
-                NestedField::optional(DEFAULT_ID, "city", Type::Primitive(PrimitiveType::String))
-                    .into(),
+                NestedField::optional(
+                    DEFAULT_FIELD_ID,
+                    "street",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::optional(
+                    DEFAULT_FIELD_ID,
+                    "city",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
             ])),
         ));
 
-        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).await.unwrap();
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {

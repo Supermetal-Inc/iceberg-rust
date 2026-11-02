@@ -38,7 +38,6 @@ async fn test_variant_schema_is_parsed() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("rest", fixture.catalog_config.clone())
@@ -70,7 +69,6 @@ async fn test_variant_arrow_schema() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("rest", fixture.catalog_config.clone())
@@ -136,7 +134,6 @@ async fn test_variant_projected_with_primitive_columns() {
     let fixture = get_test_fixture();
     let rest_catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("rest", fixture.catalog_config.clone())

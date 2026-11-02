@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use super::blob::Blob;
+use crate::Result;
 use crate::compression::CompressionCodec;
 use crate::io::{FileIO, InputFile};
 use crate::puffin::metadata::{BlobMetadata, CREATED_BY_PROPERTY, FileMetadata};
@@ -31,6 +32,23 @@ fn input_file_for_test_data(path: &str) -> InputFile {
     FileIO::new_with_fs()
         .new_input(env!("CARGO_MANIFEST_DIR").to_owned() + "/" + path)
         .unwrap()
+}
+
+/// Reads file metadata from an [`InputFile`], resolving its reader and length.
+pub(crate) async fn read_file_metadata(input_file: &InputFile) -> Result<FileMetadata> {
+    let file_read = input_file.reader().await?;
+    let file_length = input_file.metadata().await?.size;
+    FileMetadata::read(file_read.as_ref(), file_length).await
+}
+
+/// Reads file metadata with a prefetch hint from an [`InputFile`].
+pub(crate) async fn read_file_metadata_with_prefetch(
+    input_file: &InputFile,
+    prefetch_hint: u8,
+) -> Result<FileMetadata> {
+    let file_read = input_file.reader().await?;
+    let file_length = input_file.metadata().await?.size;
+    FileMetadata::read_with_prefetch(file_read.as_ref(), file_length, prefetch_hint).await
 }
 
 pub(crate) fn java_empty_uncompressed_input_file() -> InputFile {
@@ -77,7 +95,7 @@ pub(crate) fn zstd_compressed_metric_blob_0_metadata() -> BlobMetadata {
         sequence_number: METRIC_BLOB_0_SEQUENCE_NUMBER,
         offset: 4,
         length: 22,
-        compression_codec: CompressionCodec::Zstd,
+        compression_codec: CompressionCodec::zstd_default(),
         properties: HashMap::new(),
     }
 }
@@ -134,7 +152,7 @@ pub(crate) fn zstd_compressed_metric_blob_1_metadata() -> BlobMetadata {
         sequence_number: METRIC_BLOB_1_SEQUENCE_NUMBER,
         offset: 26,
         length: 77,
-        compression_codec: CompressionCodec::Zstd,
+        compression_codec: CompressionCodec::zstd_default(),
         properties: HashMap::new(),
     }
 }

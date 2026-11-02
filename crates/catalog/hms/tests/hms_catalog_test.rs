@@ -23,14 +23,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iceberg::io::{FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
+use iceberg::io::{
+    FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+    S3_SECRET_ACCESS_KEY,
+};
 use iceberg::{Catalog, CatalogBuilder, Namespace, NamespaceIdent};
 use iceberg_catalog_hms::{
     HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
     HmsCatalog, HmsCatalogBuilder, THRIFT_TRANSPORT_BUFFERED,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use iceberg_test_utils::{get_hms_endpoint, get_minio_endpoint, set_up};
+use iceberg_test_utils::{get_hms_endpoint, get_object_store_endpoint, set_up};
 use tokio::time::sleep;
 use tracing::info;
 
@@ -40,7 +43,7 @@ async fn get_catalog() -> HmsCatalog {
     set_up();
 
     let hms_endpoint = get_hms_endpoint();
-    let minio_endpoint = get_minio_endpoint();
+    let object_store_endpoint = get_object_store_endpoint();
 
     let props = HashMap::from([
         (HMS_CATALOG_PROP_URI.to_string(), hms_endpoint),
@@ -52,15 +55,15 @@ async fn get_catalog() -> HmsCatalog {
             HMS_CATALOG_PROP_WAREHOUSE.to_string(),
             "s3a://warehouse/hive".to_string(),
         ),
-        (S3_ENDPOINT.to_string(), minio_endpoint),
+        (S3_ENDPOINT.to_string(), object_store_endpoint),
         (S3_ACCESS_KEY_ID.to_string(), "admin".to_string()),
         (S3_SECRET_ACCESS_KEY.to_string(), "password".to_string()),
         (S3_REGION.to_string(), "us-east-1".to_string()),
+        (S3_PATH_STYLE_ACCESS.to_string(), "true".to_string()),
     ]);
 
     // Wait for bucket to actually exist
     let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3a".to_string(),
         customized_credential_load: None,
     }))
     .with_props(props.clone())
@@ -79,7 +82,6 @@ async fn get_catalog() -> HmsCatalog {
 
     HmsCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3a".to_string(),
             customized_credential_load: None,
         }))
         .load("hms", props)

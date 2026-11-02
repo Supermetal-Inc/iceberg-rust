@@ -30,13 +30,12 @@ use iceberg::io::{
     StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
-use opendal::Scheme;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
-use crate::{OpenDalStorage, parse_chunk_size};
+use crate::{OpenDalClientConfig, OpenDalStorage};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -51,85 +50,102 @@ pub const SCHEME_ABFSS: &str = "abfss";
 pub const SCHEME_ABFS: &str = "abfs";
 pub const SCHEME_WASBS: &str = "wasbs";
 pub const SCHEME_WASB: &str = "wasb";
+pub const SCHEME_HF: &str = "hf";
+pub const SCHEME_HDFS: &str = "hdfs";
 
-/// Parse a URL scheme string into an [`opendal::Scheme`].
-fn parse_scheme(scheme: &str) -> Result<Scheme> {
+/// Parse a URL scheme string.
+fn parse_scheme(scheme: &str) -> Result<&'static str> {
     match scheme {
-        SCHEME_MEMORY => Ok(Scheme::Memory),
-        SCHEME_FILE | "" => Ok(Scheme::Fs),
-        SCHEME_S3 | SCHEME_S3A | SCHEME_S3N => Ok(Scheme::S3),
-        SCHEME_GS | SCHEME_GCS => Ok(Scheme::Gcs),
-        SCHEME_OSS => Ok(Scheme::Oss),
-        SCHEME_ABFSS | SCHEME_ABFS | SCHEME_WASBS | SCHEME_WASB => Ok(Scheme::Azdls),
-        s => s.parse::<Scheme>().map_err(|e| {
-            Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("Unsupported storage scheme: {s}: {e}"),
-            )
-        }),
+        SCHEME_MEMORY => Ok("memory"),
+        SCHEME_FILE | "" => Ok("file"),
+        SCHEME_S3 | SCHEME_S3A | SCHEME_S3N => Ok("s3"),
+        SCHEME_GS | SCHEME_GCS => Ok("gcs"),
+        SCHEME_OSS => Ok("oss"),
+        SCHEME_ABFSS | SCHEME_ABFS | SCHEME_WASBS | SCHEME_WASB => Ok("azdls"),
+        SCHEME_HF => Ok("hf"),
+        SCHEME_HDFS => Ok("hdfs"),
+        s => Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Unsupported storage scheme: {s}"),
+        )),
     }
 }
 
-/// Extract the scheme string from a path URL.
-fn extract_scheme(path: &str) -> Result<String> {
+/// Extract the scheme from a path URL.
+fn extract_scheme(path: &str) -> Result<&'static str> {
     let url = Url::parse(path).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
             format!("Invalid path: {path}, failed to parse URL: {e}"),
         )
     })?;
-    Ok(url.scheme().to_string())
+    parse_scheme(url.scheme())
 }
 
 /// Build an [`OpenDalStorage`] variant for the given scheme and config properties.
 fn build_storage_for_scheme(
-    scheme: &str,
+    scheme: &'static str,
     props: &HashMap<String, String>,
     #[cfg(feature = "opendal-s3")] customized_credential_load: &Option<CustomAwsCredentialLoader>,
 ) -> Result<OpenDalStorage> {
-    #[allow(unused_variables)]
-    let chunk_size = parse_chunk_size(props)?;
-    match parse_scheme(scheme)? {
+    let client_config = OpenDalClientConfig::from_properties(props)?;
+    match scheme {
         #[cfg(feature = "opendal-s3")]
-        Scheme::S3 => {
+        "s3" => {
             let config = crate::s3::s3_config_parse(props.clone())?;
             Ok(OpenDalStorage::S3 {
-                configured_scheme: scheme.to_string(),
                 config: Arc::new(config),
                 customized_credential_load: customized_credential_load.clone(),
-                chunk_size,
+                client_config,
             })
         }
         #[cfg(feature = "opendal-gcs")]
-        Scheme::Gcs => {
+        "gcs" => {
             let config = crate::gcs::gcs_config_parse(props.clone())?;
             Ok(OpenDalStorage::Gcs {
                 config: Arc::new(config),
-                chunk_size,
+                client_config,
             })
         }
         #[cfg(feature = "opendal-oss")]
-        Scheme::Oss => {
+        "oss" => {
             let config = crate::oss::oss_config_parse(props.clone())?;
             Ok(OpenDalStorage::Oss {
                 config: Arc::new(config),
-                chunk_size,
+                client_config,
             })
         }
         #[cfg(feature = "opendal-azdls")]
-        Scheme::Azdls => {
-            let configured_scheme: crate::azdls::AzureStorageScheme = scheme.parse()?;
+        "azdls" => {
             let config = crate::azdls::azdls_config_parse(props.clone())?;
             Ok(OpenDalStorage::Azdls {
-                configured_scheme,
                 config: Arc::new(config),
-                chunk_size,
+                client_config,
             })
         }
         #[cfg(feature = "opendal-fs")]
-        Scheme::Fs => Ok(OpenDalStorage::LocalFs),
+        "file" => Ok(OpenDalStorage::LocalFs { client_config }),
         #[cfg(feature = "opendal-memory")]
-        Scheme::Memory => Ok(OpenDalStorage::Memory(crate::memory::memory_config_build()?)),
+        "memory" => Ok(OpenDalStorage::Memory {
+            operator: crate::memory::memory_config_build()?,
+            client_config,
+        }),
+        #[cfg(feature = "opendal-hf")]
+        "hf" => {
+            let config = crate::hf::hf_config_parse(props.clone())?;
+            Ok(OpenDalStorage::Hf {
+                config: Arc::new(config),
+                client_config,
+            })
+        }
+        #[cfg(feature = "opendal-hdfs-native")]
+        "hdfs" => {
+            let config = crate::hdfs_native::hdfs_native_config_parse(props.clone())?;
+            Ok(OpenDalStorage::HdfsNative(crate::HdfsNativeStorage::new(
+                config,
+                client_config,
+            )))
+        }
         unsupported => Err(Error::new(
             ErrorKind::FeatureUnsupported,
             format!("Unsupported storage scheme: {unsupported}"),
@@ -142,6 +158,12 @@ fn build_storage_for_scheme(
 /// This factory accepts paths from any supported storage system and dynamically
 /// delegates operations to the appropriate [`OpenDalStorage`] variant based on
 /// the path scheme.
+///
+/// # Serialization
+///
+/// Serialization fails when a custom S3 credential loader is configured because the loader holds
+/// process-local state that cannot be reconstructed in another process. Construct the factory
+/// without a custom loader before serializing it.
 ///
 /// # Example
 ///
@@ -159,7 +181,11 @@ fn build_storage_for_scheme(
 pub struct OpenDalResolvingStorageFactory {
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
-    #[serde(skip)]
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serialize_custom_credential_loader"
+    )]
     customized_credential_load: Option<CustomAwsCredentialLoader>,
 }
 
@@ -202,14 +228,15 @@ impl StorageFactory for OpenDalResolvingStorageFactory {
 /// to the appropriate [`OpenDalStorage`] variant.
 ///
 /// Sub-storages are lazily created on first use for each scheme and cached
-/// for subsequent operations.
+/// for subsequent operations. Scheme aliases like `s3`/`s3a`/`s3n` map to
+/// the same canonical scheme, so they share a storage instance.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenDalResolvingStorage {
     /// Configuration properties shared across all backends.
     props: HashMap<String, String>,
-    /// Cache of scheme → storage mappings.
+    /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
-    storages: RwLock<HashMap<String, Arc<OpenDalStorage>>>,
+    storages: RwLock<HashMap<&'static str, Arc<OpenDalStorage>>>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
@@ -217,7 +244,7 @@ pub struct OpenDalResolvingStorage {
 }
 
 impl OpenDalResolvingStorage {
-    /// Resolve the storage for the given path by extracting the scheme and
+    /// Resolve the storage for the given path by extracting the canonical scheme and
     /// returning the cached or newly-created [`OpenDalStorage`].
     fn resolve(&self, path: &str) -> Result<Arc<OpenDalStorage>> {
         let scheme = extract_scheme(path)?;
@@ -245,7 +272,7 @@ impl OpenDalResolvingStorage {
         }
 
         let storage = build_storage_for_scheme(
-            &scheme,
+            scheme,
             &self.props,
             #[cfg(feature = "opendal-s3")]
             &self.customized_credential_load,
@@ -292,9 +319,9 @@ impl Storage for OpenDalResolvingStorage {
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
-        // Group paths by scheme so each resolved storage receives a batch,
+        // Group paths by canonical scheme so each resolved storage receives a batch,
         // avoiding repeated operator creation per path.
-        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        let mut grouped: HashMap<&'static str, Vec<String>> = HashMap::new();
         while let Some(path) = paths.next().await {
             let scheme = extract_scheme(&path)?;
             grouped.entry(scheme).or_default().push(path);
@@ -321,5 +348,149 @@ impl Storage for OpenDalResolvingStorage {
             Arc::new(self.resolve(path)?.as_ref().clone()),
             path.to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::OPENDAL_IO_TIMEOUT_MS;
+
+    #[cfg(feature = "opendal-s3")]
+    #[derive(Debug)]
+    struct EmptyCredentialLoader;
+
+    #[cfg(feature = "opendal-s3")]
+    impl crate::s3::ProvideCredential for EmptyCredentialLoader {
+        type Credential = crate::s3::AwsCredential;
+
+        async fn provide_credential(
+            &self,
+            _ctx: &reqsign_core::Context,
+        ) -> reqsign_core::Result<Option<Self::Credential>> {
+            Ok(None)
+        }
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_custom_credential_loader_serialization_fails() {
+        let factory = OpenDalResolvingStorageFactory::new()
+            .with_s3_credential_loader(CustomAwsCredentialLoader::new(EmptyCredentialLoader));
+        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(factory)).build();
+
+        let err = file_io.serialize_all().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("custom AWS credential loaders cannot be serialized")
+        );
+    }
+
+    /// Builds a resolving storage with empty props, suitable for `resolve()`
+    /// calls that don't actually hit any backend.
+    fn empty_resolving_storage() -> OpenDalResolvingStorage {
+        OpenDalResolvingStorage {
+            props: HashMap::new(),
+            storages: RwLock::new(HashMap::new()),
+            #[cfg(feature = "opendal-s3")]
+            customized_credential_load: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_propagates_io_timeout() {
+        let mut storage = empty_resolving_storage();
+        storage
+            .props
+            .insert(OPENDAL_IO_TIMEOUT_MS.to_string(), "45000".to_string());
+
+        let paths: &[&str] = &[
+            #[cfg(feature = "opendal-memory")]
+            "memory:/key",
+            #[cfg(feature = "opendal-fs")]
+            "file:/key",
+            #[cfg(feature = "opendal-s3")]
+            "s3://bucket/key",
+            #[cfg(feature = "opendal-gcs")]
+            "gs://bucket/key",
+            #[cfg(feature = "opendal-oss")]
+            "oss://bucket/key",
+            #[cfg(feature = "opendal-azdls")]
+            "abfss://myfs@myaccount.dfs.core.windows.net/key",
+            #[cfg(feature = "opendal-hf")]
+            "hf://datasets/user/repo/key",
+        ];
+        for path in paths {
+            let resolved = storage.resolve(path).unwrap();
+            assert_eq!(
+                resolved.client_config().io_timeout(),
+                Duration::from_secs(45),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_resolve_s3_aliases_share_instance() {
+        let storage = empty_resolving_storage();
+
+        // All three S3-family schemes must collapse to a single cached
+        // `Arc<OpenDalStorage>` so that catalogs handing the resolver a mix
+        // of `s3://`, `s3a://`, `s3n://` paths don't rebuild operators.
+        let a = storage.resolve("s3://bucket/key").unwrap();
+        let b = storage.resolve("s3a://bucket/key").unwrap();
+        let c = storage.resolve("s3n://bucket/key").unwrap();
+
+        assert!(Arc::ptr_eq(&a, &b), "s3 and s3a should share one instance");
+        assert!(Arc::ptr_eq(&a, &c), "s3 and s3n should share one instance");
+    }
+
+    #[cfg(feature = "opendal-hdfs-native")]
+    #[test]
+    fn test_resolve_hdfs_native_returns_hdfs_variant() {
+        let storage = empty_resolving_storage();
+
+        let resolved = storage.resolve("hdfs://nameservice1/a/b").unwrap();
+
+        assert!(
+            matches!(&*resolved, OpenDalStorage::HdfsNative(_)),
+            "expected HdfsNative variant, got {resolved:?}"
+        );
+    }
+
+    #[cfg(feature = "opendal-hdfs-native")]
+    #[test]
+    fn test_resolve_hdfs_native_distinct_authorities_share_instance() {
+        let storage = empty_resolving_storage();
+
+        let a = storage.resolve("hdfs://ns1/a").unwrap();
+        let b = storage.resolve("hdfs://ns2/b").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "different authorities should share the OpenDalStorage::HdfsNative instance (operator cache is internal)"
+        );
+    }
+
+    #[cfg(feature = "opendal-azdls")]
+    #[test]
+    fn test_resolve_azdls_aliases_share_instance() {
+        let storage = empty_resolving_storage();
+
+        let path_for = |scheme: &str| {
+            format!("{scheme}://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
+        };
+
+        // All Azure schemes collapse onto one cached instance.
+        let abfss = storage.resolve(&path_for("abfss")).unwrap();
+        let abfs = storage.resolve(&path_for("abfs")).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&abfss, &abfs),
+            "abfss and abfs should share one instance"
+        );
     }
 }

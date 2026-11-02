@@ -25,16 +25,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use super::table_metadata::SnapshotLog;
-use crate::error::{Result, timestamp_ms_to_utc};
-use crate::io::FileIO;
-use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
-use crate::{Error, ErrorKind};
+use crate::error::{Result, invalid_data, timestamp_ms_to_utc};
+use crate::spec::{SchemaId, SchemaRef, TableMetadata};
 
 /// The ref name of the main branch of the table.
 pub const MAIN_BRANCH: &str = "main";
-/// Placeholder for snapshot ID. The field with this value must be replaced with the actual snapshot ID before it is committed.
-pub const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
 /// Reference to [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -176,12 +171,7 @@ impl Snapshot {
         Ok(match self.schema_id() {
             Some(schema_id) => table_metadata
                 .schema_by_id(schema_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Schema with id {schema_id} not found"),
-                    )
-                })?
+                .ok_or_else(|| invalid_data!("Schema with id {schema_id} not found"))?
                 .clone(),
             None => table_metadata.current_schema().clone(),
         })
@@ -193,29 +183,6 @@ impl Snapshot {
         match self.parent_snapshot_id {
             Some(id) => table_metadata.snapshot_by_id(id).cloned(),
             None => None,
-        }
-    }
-
-    /// Load manifest list.
-    pub async fn load_manifest_list(
-        &self,
-        file_io: &FileIO,
-        table_metadata: &TableMetadata,
-    ) -> Result<ManifestList> {
-        let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
-        ManifestList::parse_with_version(
-            &manifest_list_content,
-            // TODO: You don't really need the version since you could just project any Avro in
-            // the version that you'd like to get (probably always the latest)
-            table_metadata.format_version(),
-        )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn log(&self) -> SnapshotLog {
-        SnapshotLog {
-            timestamp_ms: self.timestamp_ms,
-            snapshot_id: self.snapshot_id,
         }
     }
 
@@ -261,9 +228,10 @@ pub(super) mod _serde {
     use serde::{Deserialize, Serialize};
 
     use super::{Operation, Snapshot, Summary};
+    use crate::Error;
+    use crate::error::invalid_data;
     use crate::spec::SchemaId;
     use crate::spec::snapshot::SnapshotRowRange;
-    use crate::{Error, ErrorKind};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
@@ -293,6 +261,7 @@ pub(super) mod _serde {
         pub snapshot_id: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub parent_snapshot_id: Option<i64>,
+        #[serde(default)]
         pub sequence_number: i64,
         pub timestamp_ms: i64,
         pub manifest_list: String,
@@ -407,15 +376,13 @@ pub(super) mod _serde {
                 manifest_list: match (v1.manifest_list, v1.manifests) {
                     (Some(file), None) => file,
                     (Some(_), Some(_)) => {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Invalid v1 snapshot, when manifest list provided, manifest files should be omitted",
+                        return Err(invalid_data!(
+                            "Invalid v1 snapshot, when manifest list provided, manifest files should be omitted"
                         ));
                     }
                     (None, _) => {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Unsupported v1 snapshot, only manifest list is supported",
+                        return Err(invalid_data!(
+                            "Unsupported v1 snapshot, only manifest list is supported"
                         ));
                     }
                 },

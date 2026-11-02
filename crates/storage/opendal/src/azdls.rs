@@ -91,10 +91,9 @@ pub(crate) fn azdls_config_parse(mut properties: HashMap<String, String>) -> Res
 pub(crate) fn azdls_create_operator<'a>(
     absolute_path: &'a str,
     config: &AzdlsConfig,
-    configured_scheme: &AzureStorageScheme,
 ) -> Result<(opendal::Operator, &'a str)> {
     let path = absolute_path.parse::<AzureStoragePath>()?;
-    match_path_with_config(&path, config, configured_scheme)?;
+    match_path_with_config(&path, config)?;
 
     let op = azdls_config_build(config, &path)?;
 
@@ -102,8 +101,7 @@ pub(crate) fn azdls_create_operator<'a>(
     // including their filesystem and account name.
     // OpenDAL's operator methods expect only the relative path, so we split it
     // off and save it for later use.
-    let relative_path_len = path.path.len();
-    let (_, relative_path) = absolute_path.split_at(absolute_path.len() - relative_path_len);
+    let relative_path = path.relative_path(absolute_path);
 
     Ok((op, relative_path))
 }
@@ -160,18 +158,7 @@ impl FromStr for AzureStorageScheme {
 }
 
 /// Validates whether the given path matches what's configured for the backend.
-pub(crate) fn match_path_with_config(
-    path: &AzureStoragePath,
-    config: &AzdlsConfig,
-    configured_scheme: &AzureStorageScheme,
-) -> Result<()> {
-    ensure_data_valid!(
-        &path.scheme == configured_scheme,
-        "Storage::Azdls: Scheme mismatch: configured {}, passed {}",
-        configured_scheme,
-        path.scheme
-    );
-
+pub(crate) fn match_path_with_config(path: &AzureStoragePath, config: &AzdlsConfig) -> Result<()> {
     if let Some(ref configured_account_name) = config.account_name {
         ensure_data_valid!(
             &path.account_name == configured_account_name,
@@ -213,9 +200,7 @@ fn azdls_config_build(config: &AzdlsConfig, path: &AzureStoragePath) -> Result<o
     }
     builder = builder.filesystem(&path.filesystem);
 
-    Ok(opendal::Operator::new(builder)
-        .map_err(from_opendal_error)?
-        .finish())
+    opendal::Operator::new(builder).map_err(from_opendal_error)
 }
 
 /// Represents a fully qualified path to blob/ file in Azure Storage.
@@ -250,6 +235,13 @@ impl AzureStoragePath {
             self.account_name,
             self.endpoint_suffix
         )
+    }
+
+    /// The part of `absolute_path` below the filesystem, without a leading `/`,
+    /// like the relative paths of the other backends.
+    pub(crate) fn relative_path<'a>(&self, absolute_path: &'a str) -> &'a str {
+        let path = &absolute_path[absolute_path.len() - self.path.len()..];
+        path.strip_prefix('/').unwrap_or(path)
     }
 }
 
@@ -408,9 +400,20 @@ mod tests {
                         endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                         ..Default::default()
                     },
-                    AzureStorageScheme::Abfss,
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
+            ),
+            (
+                "filesystem root",
+                (
+                    "abfss://myfs@myaccount.dfs.core.windows.net/",
+                    AzdlsConfig {
+                        account_name: Some("myaccount".to_string()),
+                        endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                Some(("myfs", "")),
             ),
             (
                 "different account",
@@ -421,33 +424,19 @@ mod tests {
                         endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                         ..Default::default()
                     },
-                    AzureStorageScheme::Abfss,
-                ),
-                None,
-            ),
-            (
-                "different scheme",
-                (
-                    "wasbs://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet",
-                    AzdlsConfig {
-                        account_name: Some("myaccount".to_string()),
-                        endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
-                        ..Default::default()
-                    },
-                    AzureStorageScheme::Abfss,
                 ),
                 None,
             ),
             (
                 "incompatible scheme for endpoint",
                 (
-                    "abfs://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet",
+                    // `abfss` implies https; configured endpoint is plain http.
+                    "abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet",
                     AzdlsConfig {
                         account_name: Some("myaccount".to_string()),
                         endpoint: Some("http://myaccount.dfs.core.windows.net".to_string()),
                         ..Default::default()
                     },
-                    AzureStorageScheme::Abfss,
                 ),
                 None,
             ),
@@ -460,7 +449,6 @@ mod tests {
                         endpoint: Some("https://myaccount.dfs.core.chinacloudapi.cn".to_string()),
                         ..Default::default()
                     },
-                    AzureStorageScheme::Abfss,
                 ),
                 None,
             ),
@@ -474,14 +462,27 @@ mod tests {
                         endpoint: None,
                         ..Default::default()
                     },
-                    AzureStorageScheme::Abfs,
                 ),
-                Some(("myfs", "/path/to/file.parquet")),
+                Some(("myfs", "path/to/file.parquet")),
+            ),
+            (
+                "scheme differs from a previously-configured one is accepted",
+                (
+                    // No configured scheme exists anymore; both abfss and wasbs
+                    // should be accepted by the same storage.
+                    "wasbs://myfs@myaccount.blob.core.windows.net/path/to/file.parquet",
+                    AzdlsConfig {
+                        account_name: Some("myaccount".to_string()),
+                        endpoint: Some("https://myaccount.blob.core.windows.net".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                Some(("myfs", "path/to/file.parquet")),
             ),
         ];
 
         for (name, input, expected) in test_cases {
-            let result = azdls_create_operator(input.0, &input.1, &input.2);
+            let result = azdls_create_operator(input.0, &input.1);
             match expected {
                 Some((expected_filesystem, expected_path)) => {
                     assert!(result.is_ok(), "Test case {name} failed: {result:?}");

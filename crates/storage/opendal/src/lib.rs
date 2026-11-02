@@ -18,15 +18,17 @@
 //! OpenDAL-based storage implementation for Apache Iceberg.
 //!
 //! This crate provides [`OpenDalStorage`] and [`OpenDalStorageFactory`],
-//! which implement the [`Storage`](iceberg::io::Storage) and
-//! [`StorageFactory`](iceberg::io::StorageFactory) traits from the `iceberg` crate
+//! which implement the [`Storage`] and
+//! [`StorageFactory`] traits from the `iceberg` crate
 //! using [OpenDAL](https://opendal.apache.org/) as the backend.
 
 mod utils;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,21 +36,29 @@ use cfg_if::cfg_if;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
-    FileMetadata, FileRead, FileWrite, IO_CHUNK_SIZE, InputFile, OutputFile, Storage,
-    StorageConfig, StorageFactory,
+    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    StorageFactory,
 };
 use iceberg::{Error, ErrorKind, Result};
+use iceberg_property_macro::Properties;
 use opendal::Operator;
-use opendal::layers::RetryLayer;
+use opendal::layers::{RetryLayer, TimeoutLayer};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
 cfg_if! {
     if #[cfg(feature = "opendal-azdls")] {
         mod azdls;
-        use azdls::AzureStorageScheme;
         use azdls::*;
         use opendal::services::AzdlsConfig;
+    }
+}
+
+cfg_if! {
+    if #[cfg(feature = "opendal-hf")] {
+        mod hf;
+        use hf::*;
+        use opendal::services::HfConfig;
     }
 }
 
@@ -64,6 +74,14 @@ cfg_if! {
         mod gcs;
         use gcs::*;
         use opendal::services::GcsConfig;
+    }
+}
+
+cfg_if! {
+    if #[cfg(feature = "opendal-hdfs-native")] {
+        mod hdfs_native;
+        use hdfs_native::*;
+        pub use hdfs_native::HdfsNativeStorage;
     }
 }
 
@@ -93,24 +111,71 @@ cfg_if! {
 mod resolving;
 pub use resolving::{OpenDalResolvingStorage, OpenDalResolvingStorageFactory};
 
-pub(crate) fn parse_chunk_size(props: &HashMap<String, String>) -> Result<Option<usize>> {
-    props
-        .get(IO_CHUNK_SIZE)
-        .map(|s| {
-            s.parse::<usize>().map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid {IO_CHUNK_SIZE} value `{s}`: {e}"),
-                )
-            })
-        })
-        .transpose()
+/// Timeout in milliseconds for each IO call on a reader, writer, lister or deleter, applied per
+/// retry attempt via OpenDAL's `TimeoutLayer::with_io_timeout`. Defaults to 10 seconds.
+///
+/// OpenDAL's separate `timeout`, which bounds whole control operations such as `stat`, is not
+/// affected and stays at its 60-second default.
+pub const OPENDAL_IO_TIMEOUT_MS: &str = "opendal.io-timeout-ms";
+
+/// Matches OpenDAL's `TimeoutLayer` default.
+const DEFAULT_IO_TIMEOUT_MS: NonZeroU64 = NonZeroU64::new(10_000).unwrap();
+
+/// Backend-independent client settings shared by every [`OpenDalStorage`] variant.
+#[derive(Clone, Debug, Properties, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenDalClientConfig {
+    /// IO timeout in milliseconds.
+    #[property(
+        key = OPENDAL_IO_TIMEOUT_MS,
+        default = DEFAULT_IO_TIMEOUT_MS,
+        parse_with = parse_io_timeout_ms
+    )]
+    io_timeout_ms: NonZeroU64,
+    /// Multipart upload chunk size in bytes.
+    #[property(key = "io.write.chunk-size", default = None)]
+    chunk_size: Option<usize>,
+}
+
+impl Default for OpenDalClientConfig {
+    fn default() -> Self {
+        Self {
+            io_timeout_ms: DEFAULT_IO_TIMEOUT_MS,
+            chunk_size: None,
+        }
+    }
+}
+
+impl OpenDalClientConfig {
+    pub(crate) fn io_timeout(&self) -> Duration {
+        Duration::from_millis(self.io_timeout_ms.get())
+    }
+}
+
+fn parse_io_timeout_ms(value: &str) -> Result<NonZeroU64> {
+    value.parse().map_err(|error| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            "Expected a positive integer number of milliseconds",
+        )
+        .with_context("value", format!("{value:?}"))
+        .with_source(error)
+    })
 }
 
 /// OpenDAL-based storage factory.
 ///
 /// Maps scheme to the corresponding OpenDalStorage storage variant.
 /// Use this factory with `FileIOBuilder::new(factory)` to create FileIO instances.
+///
+/// # Serialization
+///
+/// The receiving binary must enable the feature corresponding to the serialized backend variant.
+/// For example, deserializing `OpenDalStorageFactory::S3` requires the `opendal-s3` feature.
+///
+/// Serialization fails when the `OpenDalStorageFactory::S3` variant contains a custom AWS
+/// credential loader because the loader holds process-local state that cannot be reconstructed in
+/// another process. Construct the factory without a custom loader before serializing it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorageFactory {
     /// Memory storage factory.
@@ -122,66 +187,92 @@ pub enum OpenDalStorageFactory {
     /// S3 storage factory.
     #[cfg(feature = "opendal-s3")]
     S3 {
-        /// s3 storage could have `s3://` and `s3a://`.
-        /// Storing the scheme string here to return the correct path.
-        configured_scheme: String,
         /// Custom AWS credential loader.
-        #[serde(skip)]
-        customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
+        #[serde(
+            skip_deserializing,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_custom_credential_loader"
+        )]
+        customized_credential_load: Option<CustomAwsCredentialLoader>,
     },
     /// GCS storage factory.
     #[cfg(feature = "opendal-gcs")]
     Gcs,
+    /// HDFS storage factory.
+    #[cfg(feature = "opendal-hdfs-native")]
+    HdfsNative,
     /// OSS storage factory.
     #[cfg(feature = "opendal-oss")]
     Oss,
     /// Azure Data Lake Storage factory.
     #[cfg(feature = "opendal-azdls")]
-    Azdls {
-        /// The configured Azure storage scheme.
-        configured_scheme: AzureStorageScheme,
-    },
+    Azdls,
+    /// HuggingFace Hub storage factory.
+    #[cfg(feature = "opendal-hf")]
+    Hf,
+}
+
+#[cfg(feature = "opendal-s3")]
+pub(crate) fn serialize_custom_credential_loader<S>(
+    _loader: &Option<CustomAwsCredentialLoader>,
+    _serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    Err(serde::ser::Error::custom(
+        "custom AWS credential loaders cannot be serialized",
+    ))
 }
 
 #[typetag::serde(name = "OpenDalStorageFactory")]
 impl StorageFactory for OpenDalStorageFactory {
     #[allow(unused_variables)]
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        let client_config = OpenDalClientConfig::from_properties(config.props())?;
         match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorageFactory::Memory => {
-                Ok(Arc::new(OpenDalStorage::Memory(memory_config_build()?)))
-            }
+            OpenDalStorageFactory::Memory => Ok(Arc::new(OpenDalStorage::Memory {
+                operator: memory_config_build()?,
+                client_config,
+            })),
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs)),
+            OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs { client_config })),
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
-                configured_scheme,
                 customized_credential_load,
             } => Ok(Arc::new(OpenDalStorage::S3 {
-                configured_scheme: configured_scheme.clone(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
-                chunk_size: parse_chunk_size(config.props())?,
+                client_config,
             })),
             #[cfg(feature = "opendal-gcs")]
             OpenDalStorageFactory::Gcs => Ok(Arc::new(OpenDalStorage::Gcs {
                 config: gcs_config_parse(config.props().clone())?.into(),
-                chunk_size: parse_chunk_size(config.props())?,
+                client_config,
             })),
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorageFactory::HdfsNative => Ok(Arc::new(OpenDalStorage::HdfsNative(
+                HdfsNativeStorage::new(
+                    hdfs_native_config_parse(config.props().clone())?,
+                    client_config,
+                ),
+            ))),
             #[cfg(feature = "opendal-oss")]
             OpenDalStorageFactory::Oss => Ok(Arc::new(OpenDalStorage::Oss {
                 config: oss_config_parse(config.props().clone())?.into(),
-                chunk_size: parse_chunk_size(config.props())?,
+                client_config,
             })),
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls { configured_scheme } => {
-                Ok(Arc::new(OpenDalStorage::Azdls {
-                    configured_scheme: configured_scheme.clone(),
-                    config: azdls_config_parse(config.props().clone())?.into(),
-                    chunk_size: parse_chunk_size(config.props())?,
-                }))
-            }
+            OpenDalStorageFactory::Azdls => Ok(Arc::new(OpenDalStorage::Azdls {
+                config: azdls_config_parse(config.props().clone())?.into(),
+                client_config,
+            })),
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorageFactory::Hf => Ok(Arc::new(OpenDalStorage::Hf {
+                config: hf_config_parse(config.props().clone())?.into(),
+                client_config,
+            })),
             #[cfg(all(
                 not(feature = "opendal-memory"),
                 not(feature = "opendal-fs"),
@@ -189,6 +280,8 @@ impl StorageFactory for OpenDalStorageFactory {
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
+                not(feature = "opendal-hdfs-native"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -205,55 +298,89 @@ fn default_memory_operator() -> Operator {
 }
 
 /// OpenDAL-based storage implementation.
+///
+/// The serialized representation is not a stable format and may change between crate versions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpenDalStorage {
     /// Memory storage variant.
     #[cfg(feature = "opendal-memory")]
-    Memory(#[serde(skip, default = "self::default_memory_operator")] Operator),
+    Memory {
+        /// Pre-built memory operator.
+        #[serde(skip, default = "self::default_memory_operator")]
+        operator: Operator,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
+    },
     /// Local filesystem storage variant.
     #[cfg(feature = "opendal-fs")]
-    LocalFs,
+    LocalFs {
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
+    },
     /// S3 storage variant.
+    ///
+    /// Accepts any S3-family URL (`s3://`, `s3a://`, `s3n://`); the scheme is
+    /// derived from the path at call time.
     #[cfg(feature = "opendal-s3")]
     S3 {
-        /// s3 storage could have `s3://` and `s3a://`.
-        /// Storing the scheme string here to return the correct path.
-        configured_scheme: String,
         /// S3 configuration.
         config: Arc<S3Config>,
         /// Custom AWS credential loader.
         #[serde(skip)]
-        customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
-        chunk_size: Option<usize>,
+        customized_credential_load: Option<CustomAwsCredentialLoader>,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
     },
     /// GCS storage variant.
     #[cfg(feature = "opendal-gcs")]
     Gcs {
         /// GCS configuration.
         config: Arc<GcsConfig>,
-        chunk_size: Option<usize>,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
     },
+    /// HDFS storage variant; see [`HdfsNativeStorage`].
+    #[cfg(feature = "opendal-hdfs-native")]
+    HdfsNative(HdfsNativeStorage),
     /// OSS storage variant.
     #[cfg(feature = "opendal-oss")]
     Oss {
         /// OSS configuration.
         config: Arc<OssConfig>,
-        chunk_size: Option<usize>,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
     },
     /// Azure Data Lake Storage variant.
-    /// Expects paths of the form
+    ///
+    /// Accepts paths of the form
     /// `abfs[s]://<filesystem>@<account>.dfs.<endpoint-suffix>/<path>` or
     /// `wasb[s]://<container>@<account>.blob.<endpoint-suffix>/<path>`.
+    /// The scheme is derived from the path at call time.
     #[cfg(feature = "opendal-azdls")]
-    #[allow(private_interfaces)]
     Azdls {
-        /// The configured Azure storage scheme.
-        /// Because Azdls accepts multiple possible schemes, we store the full
-        /// passed scheme here to later validate schemes passed via paths.
-        configured_scheme: AzureStorageScheme,
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
-        chunk_size: Option<usize>,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
+    },
+    /// HuggingFace Hub storage variant.
+    ///
+    /// Accepts paths of the form
+    /// `hf://<repo_type>/<owner>/<repo>[@<revision>]/<path_in_repo>`,
+    /// where `<repo_type>` must be one of `models`, `datasets`, `spaces`, or `buckets`.
+    #[cfg(feature = "opendal-hf")]
+    Hf {
+        /// HuggingFace Hub configuration (token + endpoint).
+        config: Arc<HfConfig>,
+        /// Backend-independent client settings.
+        #[serde(default)]
+        client_config: OpenDalClientConfig,
     },
 }
 
@@ -278,7 +405,7 @@ impl OpenDalStorage {
         let path = path.as_ref();
         let (operator, relative_path): (Operator, &str) = match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(op) => {
+            OpenDalStorage::Memory { operator: op, .. } => {
                 if let Some(stripped) = path.strip_prefix("memory:/") {
                     (op.clone(), stripped)
                 } else {
@@ -286,7 +413,7 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => {
+            OpenDalStorage::LocalFs { .. } => {
                 let op = fs_config_build()?;
                 if let Some(stripped) = path.strip_prefix("file:/") {
                     (op, stripped)
@@ -296,7 +423,6 @@ impl OpenDalStorage {
             }
             #[cfg(feature = "opendal-s3")]
             OpenDalStorage::S3 {
-                configured_scheme,
                 config,
                 customized_credential_load,
                 ..
@@ -304,8 +430,15 @@ impl OpenDalStorage {
                 let op = s3_config_build(config, customized_credential_load, path)?;
                 let op_info = op.info();
 
-                // Check prefix of s3 path.
-                let prefix = format!("{}://{}/", configured_scheme, op_info.name());
+                // Use the URL scheme in the path for prefix matching. This enables
+                // use of S3-compatible storage backends using custom schemes (e.g., `minio://`, `r2://`).
+                let url = url::Url::parse(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}: {e}"),
+                    )
+                })?;
+                let prefix = format!("{}://{}/", url.scheme(), op_info.name());
                 if path.starts_with(&prefix) {
                     (op, &path[prefix.len()..])
                 } else {
@@ -328,6 +461,10 @@ impl OpenDalStorage {
                     ));
                 }
             }
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorage::HdfsNative(storage) => {
+                hdfs_native_create_operator(path, &storage.config, &storage.operators)?
+            }
             #[cfg(feature = "opendal-oss")]
             OpenDalStorage::Oss { config, .. } => {
                 let op = oss_config_build(config, path)?;
@@ -342,17 +479,17 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls {
-                configured_scheme,
-                config,
-                ..
-            } => azdls_create_operator(path, config, configured_scheme)?,
+            OpenDalStorage::Azdls { config, .. } => azdls_create_operator(path, config)?,
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { config, .. } => hf_config_build(config, path)?,
             #[cfg(all(
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
+                not(feature = "opendal-hdfs-native"),
             ))]
             _ => {
                 return Err(Error::new(
@@ -362,25 +499,70 @@ impl OpenDalStorage {
             }
         };
 
-        // Transient errors are common for object stores; however there's no
-        // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(RetryLayer::new());
+        // Apply observability/resilience layers. TimeoutLayer must be
+        // inside RetryLayer so each retry attempt is independently
+        // bounded — without a per-attempt timeout, a future parked on a
+        // silently dropped TCP connection never produces an `Err` and
+        // RetryLayer cannot retry, leaving the caller hung indefinitely.
+        // See: https://opendal.apache.org/docs/rust/opendal/layers/struct.TimeoutLayer.html
+        //
+        // Transient errors are common for object stores; we retry temporary
+        // failures with exponential backoff. The retry behavior also
+        // benefits non-object-store backends.
+        let operator = operator
+            .layer(TimeoutLayer::new().with_io_timeout(self.client_config().io_timeout()))
+            .layer(RetryLayer::new());
         Ok((operator, relative_path))
     }
 
-    /// Per-part chunk size for the writer, if configured. Returns `None` for
-    #[allow(unreachable_code, unused_variables)]
-    pub(crate) fn chunk_size(&self) -> Option<usize> {
+    pub(crate) fn client_config(&self) -> &OpenDalClientConfig {
         match self {
+            #[cfg(feature = "opendal-memory")]
+            OpenDalStorage::Memory { client_config, .. } => client_config,
+            #[cfg(feature = "opendal-fs")]
+            OpenDalStorage::LocalFs { client_config } => client_config,
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 { chunk_size, .. } => *chunk_size,
+            OpenDalStorage::S3 { client_config, .. } => client_config,
             #[cfg(feature = "opendal-gcs")]
-            OpenDalStorage::Gcs { chunk_size, .. } => *chunk_size,
+            OpenDalStorage::Gcs { client_config, .. } => client_config,
             #[cfg(feature = "opendal-oss")]
-            OpenDalStorage::Oss { chunk_size, .. } => *chunk_size,
+            OpenDalStorage::Oss { client_config, .. } => client_config,
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls { chunk_size, .. } => *chunk_size,
-            _ => None,
+            OpenDalStorage::Azdls { client_config, .. } => client_config,
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { client_config, .. } => client_config,
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorage::HdfsNative(storage) => &storage.client_config,
+            #[cfg(all(
+                not(feature = "opendal-memory"),
+                not(feature = "opendal-s3"),
+                not(feature = "opendal-fs"),
+                not(feature = "opendal-gcs"),
+                not(feature = "opendal-oss"),
+                not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
+                not(feature = "opendal-hdfs-native"),
+            ))]
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns a cache key used by `delete_stream` to group paths by storage operator.
+    ///
+    /// For most backends the URL host (bucket name) is sufficient. For HF the host
+    /// encodes the repo type, not the repo identity, so a more specific key is used.
+    fn batch_key_for_path(&self, path: &str) -> String {
+        match self {
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { .. } => hf_batch_key(path),
+            // The URL host alone would merge distinct NameNodes that differ
+            // only by port; key by the effective NameNode instead.
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorage::HdfsNative(storage) => hdfs_native_batch_key(&storage.config, path),
+            _ => url::Url::parse(path)
+                .ok()
+                .and_then(|u| u.host_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
         }
     }
 
@@ -393,13 +575,13 @@ impl OpenDalStorage {
     pub(crate) fn relativize_path<'a>(&self, path: &'a str) -> Result<&'a str> {
         match self {
             #[cfg(feature = "opendal-memory")]
-            OpenDalStorage::Memory(_) => Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..])),
+            OpenDalStorage::Memory { .. } => {
+                Ok(path.strip_prefix("memory:/").unwrap_or(&path[1..]))
+            }
             #[cfg(feature = "opendal-fs")]
-            OpenDalStorage::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
+            OpenDalStorage::LocalFs { .. } => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 {
-                configured_scheme, ..
-            } => {
+            OpenDalStorage::S3 { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -407,7 +589,7 @@ impl OpenDalStorage {
                         format!("Invalid s3 url: {path}, missing bucket"),
                     )
                 })?;
-                let prefix = format!("{}://{}/", configured_scheme, bucket);
+                let prefix = format!("{}://{}/", url.scheme(), bucket);
                 if path.starts_with(&prefix) {
                     Ok(&path[prefix.len()..])
                 } else {
@@ -436,6 +618,11 @@ impl OpenDalStorage {
                     ))
                 }
             }
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorage::HdfsNative(storage) => {
+                let (_, relative_path) = hdfs_native_effective_name_node(&storage.config, path)?;
+                Ok(relative_path)
+            }
             #[cfg(feature = "opendal-oss")]
             OpenDalStorage::Oss { .. } => {
                 let url = url::Url::parse(path)?;
@@ -456,15 +643,17 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls {
-                configured_scheme,
-                config,
-                ..
-            } => {
+            OpenDalStorage::Azdls { config, .. } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
-                match_path_with_config(&azure_path, config, configured_scheme)?;
-                let relative_path_len = azure_path.path.len();
-                Ok(&path[path.len() - relative_path_len..])
+                match_path_with_config(&azure_path, config)?;
+                Ok(azure_path.relative_path(path))
+            }
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { .. } => {
+                let parsed = HfUri::parse(path).ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, format!("Invalid hf url: {path}"))
+                })?;
+                Ok(&path[path.len() - parsed.path.len()..])
             }
             #[cfg(all(
                 not(feature = "opendal-s3"),
@@ -472,6 +661,8 @@ impl OpenDalStorage {
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
+                not(feature = "opendal-hdfs-native"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -523,11 +714,13 @@ impl Storage for OpenDalStorage {
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let (op, relative_path) = self.create_operator(&path)?;
-        let writer = match self.chunk_size() {
-            Some(chunk_size) => op.writer_with(relative_path).chunk(chunk_size).await,
+        let writer = match self.client_config().chunk_size {
+            Some(size) => op.writer_with(relative_path).chunk(size).await,
             None => op.writer(relative_path).await,
         };
-        Ok(Box::new(OpenDalWriter(writer.map_err(from_opendal_error)?)))
+        Ok(Box::new(OpenDalWriter::new(
+            writer.map_err(from_opendal_error)?,
+        )))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -542,17 +735,18 @@ impl Storage for OpenDalStorage {
         } else {
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await.map_err(from_opendal_error)?)
+        Ok(op
+            .delete_with(&path)
+            .recursive(true)
+            .await
+            .map_err(from_opendal_error)?)
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
         while let Some(path) = paths.next().await {
-            let bucket = url::Url::parse(&path)
-                .ok()
-                .and_then(|u| u.host_str().map(|s| s.to_string()))
-                .unwrap_or_default();
+            let bucket = self.batch_key_for_path(&path);
 
             let (relative_path, deleter) = match deleters.entry(bucket) {
                 Entry::Occupied(entry) => {
@@ -608,27 +802,248 @@ impl FileRead for OpenDalReader {
 }
 
 /// Wrapper around `opendal::Writer` that implements `FileWrite`.
-pub(crate) struct OpenDalWriter(pub(crate) opendal::Writer);
+pub(crate) struct OpenDalWriter {
+    inner: opendal::Writer,
+    bytes_written: u64,
+}
+
+impl OpenDalWriter {
+    pub(crate) fn new(inner: opendal::Writer) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+}
 
 #[async_trait]
 impl FileWrite for OpenDalWriter {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
-        Ok(opendal::Writer::write(&mut self.0, bs)
-            .await
-            .map_err(from_opendal_error)?)
-    }
-
-    async fn close(&mut self) -> Result<()> {
-        let _ = opendal::Writer::close(&mut self.0)
+        let len = bs.len() as u64;
+        opendal::Writer::write(&mut self.inner, bs)
             .await
             .map_err(from_opendal_error)?;
+        self.bytes_written += len;
         Ok(())
+    }
+
+    async fn close(&mut self) -> Result<FileMetadata> {
+        let metadata = opendal::Writer::close(&mut self.inner)
+            .await
+            .map_err(from_opendal_error)?;
+
+        // Object stores may omit the size (reported as 0); validate only a reported nonzero size.
+        let reported_size = metadata.content_length();
+        if reported_size != 0 && reported_size != self.bytes_written {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Wrote {} bytes but storage reports {reported_size}",
+                    self.bytes_written
+                ),
+            ));
+        }
+
+        Ok(FileMetadata {
+            size: self.bytes_written,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client_config(value: &str) -> Result<OpenDalClientConfig> {
+        OpenDalClientConfig::from_properties(&HashMap::from([(
+            OPENDAL_IO_TIMEOUT_MS.to_string(),
+            value.to_string(),
+        )]))
+    }
+
+    #[test]
+    fn test_io_timeout_parsing() {
+        let unset = OpenDalClientConfig::from_properties(&HashMap::new()).unwrap();
+        assert_eq!(
+            unset.io_timeout(),
+            Duration::from_millis(DEFAULT_IO_TIMEOUT_MS.get())
+        );
+
+        let max = u64::MAX.to_string();
+        for (valid, ms) in [("45000", 45_000), ("1", 1), (max.as_str(), u64::MAX)] {
+            assert_eq!(
+                client_config(valid).unwrap().io_timeout(),
+                Duration::from_millis(ms),
+                "{valid}"
+            );
+        }
+
+        for invalid in ["0", "-1", "12.5", "abc", "", "18446744073709551616"] {
+            let err = client_config(invalid).unwrap_err().to_string();
+            assert!(err.contains(OPENDAL_IO_TIMEOUT_MS), "{invalid}");
+            assert!(err.contains(&format!("value: {invalid:?}")), "{err}");
+            let reason = invalid.parse::<NonZeroU64>().unwrap_err().to_string();
+            assert!(err.contains(&reason), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_default_timeouts_match_opendal() {
+        // `TimeoutLayer` has no getters, so compare through `Debug`.
+        let opendal_default = format!("{:?}", TimeoutLayer::new());
+        let layer = |timeout, io_timeout| {
+            format!(
+                "{:?}",
+                TimeoutLayer::new()
+                    .with_timeout(timeout)
+                    .with_io_timeout(io_timeout)
+            )
+        };
+        let control = Duration::from_secs(60);
+        let io = Duration::from_millis(DEFAULT_IO_TIMEOUT_MS.get());
+        assert_eq!(opendal_default, layer(control, io));
+        assert_ne!(opendal_default, layer(control + Duration::from_secs(1), io));
+        assert_ne!(
+            opendal_default,
+            layer(control, io + Duration::from_millis(1))
+        );
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_client_config_serde_round_trip() {
+        let storage = OpenDalStorage::S3 {
+            config: Arc::new(S3Config::default()),
+            customized_credential_load: None,
+            client_config: client_config("45000").unwrap(),
+        };
+
+        let mut value = serde_json::to_value(&storage).unwrap();
+        let restored: OpenDalStorage = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            restored.client_config().io_timeout(),
+            Duration::from_secs(45)
+        );
+
+        let mut zero = value.clone();
+        zero["S3"]["client_config"]["io_timeout_ms"] = 0.into();
+        assert!(serde_json::from_value::<OpenDalStorage>(zero).is_err());
+
+        value["S3"].as_object_mut().unwrap().remove("client_config");
+        let restored: OpenDalStorage = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.client_config().io_timeout(),
+            Duration::from_millis(DEFAULT_IO_TIMEOUT_MS.get())
+        );
+    }
+
+    #[cfg(all(feature = "opendal-fs", feature = "opendal-memory"))]
+    #[test]
+    fn test_old_unit_variant_forms_are_rejected() {
+        for old in [r#""LocalFs""#, r#""Memory""#, r#"{"Memory":null}"#] {
+            assert!(
+                serde_json::from_str::<OpenDalStorage>(old).is_err(),
+                "{old}"
+            );
+        }
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[test]
+    fn test_factory_rejects_invalid_io_timeout() {
+        let config = StorageConfig::new().with_prop(OPENDAL_IO_TIMEOUT_MS, "nope");
+
+        let err = OpenDalStorageFactory::Memory.build(&config).unwrap_err();
+        assert!(err.to_string().contains(OPENDAL_IO_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn test_factory_propagates_io_timeout() {
+        let config = StorageConfig::new().with_prop(OPENDAL_IO_TIMEOUT_MS, "45000");
+        let factories = [
+            #[cfg(feature = "opendal-memory")]
+            OpenDalStorageFactory::Memory,
+            #[cfg(feature = "opendal-fs")]
+            OpenDalStorageFactory::Fs,
+            #[cfg(feature = "opendal-s3")]
+            OpenDalStorageFactory::S3 {
+                customized_credential_load: None,
+            },
+            #[cfg(feature = "opendal-gcs")]
+            OpenDalStorageFactory::Gcs,
+            #[cfg(feature = "opendal-oss")]
+            OpenDalStorageFactory::Oss,
+            #[cfg(feature = "opendal-azdls")]
+            OpenDalStorageFactory::Azdls,
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorageFactory::Hf,
+            #[cfg(feature = "opendal-hdfs-native")]
+            OpenDalStorageFactory::HdfsNative,
+        ];
+        for factory in factories {
+            // `build` returns `dyn Storage`, so read the config back from its serialized form.
+            let storage = factory.build(&config).unwrap();
+            let json = serde_json::to_value(&*storage).unwrap();
+            let client_config = json
+                .as_object()
+                .unwrap()
+                .values()
+                .find_map(|variant| variant.get("client_config"))
+                .unwrap_or_else(|| panic!("{json}"));
+            assert_eq!(client_config["io_timeout_ms"], 45_000, "{factory:?}");
+        }
+    }
+
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test(start_paused = true)]
+    async fn test_io_timeout_reaches_timeout_layer() {
+        use opendal::layers::ConcurrentLimitLayer;
+
+        // A zero concurrency limit stalls every IO call; paused time skips the waits.
+        let storage = OpenDalStorage::Memory {
+            operator: default_memory_operator().layer(ConcurrentLimitLayer::new(0)),
+            client_config: client_config("45000").unwrap(),
+        };
+
+        let err = storage
+            .read("memory:/stalled")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("io operation timeout reached"), "{err}");
+        assert!(err.contains("{ timeout: 45 }"), "{err}");
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[derive(Debug)]
+    struct EmptyCredentialLoader;
+
+    #[cfg(feature = "opendal-s3")]
+    impl ProvideCredential for EmptyCredentialLoader {
+        type Credential = AwsCredential;
+
+        async fn provide_credential(
+            &self,
+            _ctx: &reqsign_core::Context,
+        ) -> reqsign_core::Result<Option<AwsCredential>> {
+            Ok(None)
+        }
+    }
+
+    #[cfg(feature = "opendal-s3")]
+    #[test]
+    fn test_s3_factory_custom_credential_loader_serialization_fails() {
+        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(CustomAwsCredentialLoader::new(EmptyCredentialLoader)),
+        }))
+        .build();
+
+        let err = file_io.serialize_all().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("custom AWS credential loaders cannot be serialized")
+        );
+    }
 
     #[cfg(feature = "opendal-memory")]
     #[test]
@@ -638,9 +1053,47 @@ mod tests {
     }
 
     #[cfg(feature = "opendal-memory")]
+    #[tokio::test]
+    async fn test_writer_close_returns_stored_size() {
+        use iceberg::encryption::{EncryptedOutputFile, StandardKeyMetadata};
+
+        // Note: the memory service does report a content length, so this only pins the happy
+        // path. The counter in `OpenDalWriter` is what covers services that don't, such as S3.
+        let storage = Arc::new(OpenDalStorage::Memory {
+            operator: default_memory_operator(),
+            client_config: OpenDalClientConfig::default(),
+        });
+        let path = "memory:///stored-size";
+        for plaintext in [
+            Bytes::new(),
+            Bytes::from_static(b"test data"),
+            Bytes::from(vec![7; 3 * 1024]),
+        ] {
+            let mut writer = storage.writer(path).await.unwrap();
+            for chunk in plaintext.chunks(1024) {
+                writer.write(Bytes::copy_from_slice(chunk)).await.unwrap();
+            }
+            let metadata = writer.close().await.unwrap();
+            assert_eq!(metadata.size, plaintext.len() as u64);
+            assert_eq!(metadata.size, storage.metadata(path).await.unwrap().size);
+
+            let output = EncryptedOutputFile::new(
+                OutputFile::new(storage.clone(), path.to_string()),
+                StandardKeyMetadata::try_new(b"0123456789abcdef").unwrap(),
+            );
+            let metadata = output.write(plaintext.clone()).await.unwrap();
+            assert!(metadata.size > plaintext.len() as u64);
+            assert_eq!(metadata.size, storage.metadata(path).await.unwrap().size);
+        }
+    }
+
+    #[cfg(feature = "opendal-memory")]
     #[test]
     fn test_relativize_path_memory() {
-        let storage = OpenDalStorage::Memory(default_memory_operator());
+        let storage = OpenDalStorage::Memory {
+            operator: default_memory_operator(),
+            client_config: OpenDalClientConfig::default(),
+        };
 
         assert_eq!(
             storage.relativize_path("memory:/path/to/file").unwrap(),
@@ -656,7 +1109,9 @@ mod tests {
     #[cfg(feature = "opendal-fs")]
     #[test]
     fn test_relativize_path_fs() {
-        let storage = OpenDalStorage::LocalFs;
+        let storage = OpenDalStorage::LocalFs {
+            client_config: OpenDalClientConfig::default(),
+        };
 
         assert_eq!(
             storage
@@ -674,50 +1129,22 @@ mod tests {
     #[test]
     fn test_relativize_path_s3() {
         let storage = OpenDalStorage::S3 {
-            configured_scheme: "s3".to_string(),
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
-        assert_eq!(
-            storage
-                .relativize_path("s3://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
-
-        // s3a scheme
-        let storage_s3a = OpenDalStorage::S3 {
-            configured_scheme: "s3a".to_string(),
-            config: Arc::new(S3Config::default()),
-            customized_credential_load: None,
-            chunk_size: None,
-        };
-        assert_eq!(
-            storage_s3a
-                .relativize_path("s3a://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
-    }
-
-    #[cfg(feature = "opendal-s3")]
-    #[test]
-    fn test_relativize_path_s3_scheme_mismatch() {
-        let storage = OpenDalStorage::S3 {
-            configured_scheme: "s3".to_string(),
-            config: Arc::new(S3Config::default()),
-            customized_credential_load: None,
-            chunk_size: None,
-        };
-
-        // Scheme mismatch should error
-        assert!(
-            storage
-                .relativize_path("s3a://my-bucket/path/to/file.parquet")
-                .is_err()
-        );
+        // All S3-family schemes are accepted by the same storage instance.
+        // Custom schemes for S3-compatible stores (e.g., `minio://`) are also
+        // accepted because the path's scheme is used as-is for prefix matching.
+        for scheme in ["s3", "s3a", "s3n", "minio"] {
+            assert_eq!(
+                storage
+                    .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
+                    .unwrap(),
+                "path/to/file.parquet"
+            );
+        }
     }
 
     #[cfg(feature = "opendal-gcs")]
@@ -725,7 +1152,7 @@ mod tests {
     fn test_relativize_path_gcs() {
         let storage = OpenDalStorage::Gcs {
             config: Arc::new(GcsConfig::default()),
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
         assert_eq!(
@@ -741,7 +1168,7 @@ mod tests {
     fn test_relativize_path_gcs_invalid_scheme() {
         let storage = OpenDalStorage::Gcs {
             config: Arc::new(GcsConfig::default()),
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
         assert!(
@@ -756,7 +1183,7 @@ mod tests {
     fn test_relativize_path_oss() {
         let storage = OpenDalStorage::Oss {
             config: Arc::new(OssConfig::default()),
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
         assert_eq!(
@@ -772,7 +1199,7 @@ mod tests {
     fn test_relativize_path_oss_invalid_scheme() {
         let storage = OpenDalStorage::Oss {
             config: Arc::new(OssConfig::default()),
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
         assert!(
@@ -786,41 +1213,37 @@ mod tests {
     #[test]
     fn test_relativize_path_azdls() {
         let storage = OpenDalStorage::Azdls {
-            configured_scheme: AzureStorageScheme::Abfss,
             config: Arc::new(AzdlsConfig {
                 account_name: Some("myaccount".to_string()),
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
                 ..Default::default()
             }),
-            chunk_size: None,
+            client_config: OpenDalClientConfig::default(),
         };
 
         assert_eq!(
             storage
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
-            "/path/to/file.parquet"
+            "path/to/file.parquet"
         );
     }
-
-    #[cfg(feature = "opendal-azdls")]
     #[test]
-    fn test_relativize_path_azdls_scheme_mismatch() {
-        let storage = OpenDalStorage::Azdls {
-            configured_scheme: AzureStorageScheme::Abfss,
-            config: Arc::new(AzdlsConfig {
-                account_name: Some("myaccount".to_string()),
-                endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
-                ..Default::default()
-            }),
-            chunk_size: None,
-        };
-
-        // wasbs scheme doesn't match configured abfss
-        assert!(
-            storage
-                .relativize_path("wasbs://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
-                .is_err()
+    fn test_chunk_size_property() {
+        assert_eq!(
+            OpenDalClientConfig::from_properties(&HashMap::new())
+                .unwrap()
+                .chunk_size,
+            None
         );
+        let mut props = HashMap::from([("io.write.chunk-size".to_string(), "8388608".to_string())]);
+        assert_eq!(
+            OpenDalClientConfig::from_properties(&props)
+                .unwrap()
+                .chunk_size,
+            Some(8388608)
+        );
+        props.insert("io.write.chunk-size".to_string(), "invalid".to_string());
+        assert!(OpenDalClientConfig::from_properties(&props).is_err());
     }
 }

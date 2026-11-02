@@ -26,189 +26,99 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{PrimitiveBuilder, StringBuilder};
 use arrow_array::types::Int64Type;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use once_cell::sync::Lazy;
 
-use crate::arrow::schema_to_arrow_schema;
-use crate::spec::{
-    DataContentType, DataFile, NestedField, NestedFieldRef, PartitionKey, PrimitiveType, Schema,
-    Struct, Type,
-};
+use super::position_delete_writer as upstream;
+use crate::spec::{DataFile, PartitionKey, Schema};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
-use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
+use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
 
-static DELETE_FILE_PATH: Lazy<NestedFieldRef> = Lazy::new(|| {
-    Arc::new(NestedField::required(
-        2147483546,
-        "file_path",
-        Type::Primitive(PrimitiveType::String),
-    ))
-});
-static DELETE_FILE_POS: Lazy<NestedFieldRef> = Lazy::new(|| {
-    Arc::new(NestedField::required(
-        2147483545,
-        "pos",
-        Type::Primitive(PrimitiveType::Long),
-    ))
-});
-/// Iceberg schema used for position delete files (file_path, pos).
-pub static POSITION_DELETE_SCHEMA: Lazy<Schema> = Lazy::new(|| {
-    Schema::builder()
-        .with_fields(vec![DELETE_FILE_PATH.clone(), DELETE_FILE_POS.clone()])
-        .build()
-        .unwrap()
-});
-static POSITION_DELETE_ARROW_SCHEMA: Lazy<ArrowSchemaRef> = Lazy::new(|| {
-    Arc::new(
-        schema_to_arrow_schema(&POSITION_DELETE_SCHEMA)
-            .expect("position delete schema should always convert to arrow schema"),
-    )
-});
+/// Canonical schema for position delete files.
+pub static POSITION_DELETE_SCHEMA: Lazy<Schema> =
+    Lazy::new(|| upstream::position_delete_schema().as_ref().clone());
 
-/// Position delete input.
+/// A row position to delete from a data file.
 #[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Debug)]
 pub struct PositionDeleteInput {
-    /// The path of the file.
+    /// Data file path.
     pub path: Arc<str>,
-    /// The row number in data file
+    /// Row position within the file.
     pub pos: i64,
 }
-
 impl PositionDeleteInput {
-    /// Create a new `PositionDeleteInput`.
+    /// Creates a position delete.
     pub fn new(path: Arc<str>, row: i64) -> Self {
         Self { path, pos: row }
     }
 }
-/// Builder for `PositionDeleteFileWriter`.
+
+/// Builds a position-delete writer accepting row positions.
 #[derive(Clone, Debug)]
 pub struct PositionDeleteFileWriterBuilder<
     B: FileWriterBuilder,
     L: LocationGenerator,
     F: FileNameGenerator,
 > {
-    inner: RollingFileWriterBuilder<B, L, F>,
+    inner: upstream::PositionDeleteFileWriterBuilder<B, L, F>,
 }
-
-impl<B, L, F> PositionDeleteFileWriterBuilder<B, L, F>
-where
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
+impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator>
+    PositionDeleteFileWriterBuilder<B, L, F>
 {
-    /// Create a new builder using an underlying `RollingFileWriterBuilder`.
+    /// Wraps a rolling Parquet writer.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
-        Self { inner }
+        Self {
+            inner: upstream::PositionDeleteFileWriterBuilder::new(inner),
+        }
     }
 }
-
 #[async_trait::async_trait]
-impl<B, L, F> IcebergWriterBuilder<Vec<PositionDeleteInput>>
-    for PositionDeleteFileWriterBuilder<B, L, F>
-where
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
+impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator>
+    IcebergWriterBuilder<Vec<PositionDeleteInput>> for PositionDeleteFileWriterBuilder<B, L, F>
 {
     type R = PositionDeleteFileWriter<B, L, F>;
-
     async fn build(&self, partition_key: Option<PartitionKey>) -> Result<Self::R> {
         Ok(PositionDeleteFileWriter {
-            inner: Some(self.inner.build()),
-            partition_key,
+            inner: self.inner.build(partition_key).await?,
         })
     }
 }
 
-/// Position delete writer.
+/// Adapts row positions to the canonical position-delete writer.
 pub struct PositionDeleteFileWriter<
     B: FileWriterBuilder,
     L: LocationGenerator,
     F: FileNameGenerator,
 > {
-    inner: Option<RollingFileWriter<B, L, F>>,
-    partition_key: Option<PartitionKey>,
+    inner: upstream::PositionDeleteFileWriter<B, L, F>,
 }
-
 #[async_trait::async_trait]
-impl<B, L, F> IcebergWriter<Vec<PositionDeleteInput>> for PositionDeleteFileWriter<B, L, F>
-where
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
+impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator>
+    IcebergWriter<Vec<PositionDeleteInput>> for PositionDeleteFileWriter<B, L, F>
 {
     async fn write(&mut self, input: Vec<PositionDeleteInput>) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
-
-        let batch = build_position_delete_batch(input)?;
-
-        if let Some(writer) = self.inner.as_mut() {
-            writer.write(&self.partition_key, &batch).await
-        } else {
-            Err(Error::new(
-                ErrorKind::Unexpected,
-                "Position delete writer has been closed.",
-            ))
-        }
+        self.inner.write(build_position_delete_batch(input)?).await
     }
-
     async fn close(&mut self) -> Result<Vec<DataFile>> {
-        if let Some(writer) = self.inner.take() {
-            writer
-                .close()
-                .await?
-                .into_iter()
-                .map(|mut builder| {
-                    builder.content(DataContentType::PositionDeletes);
-                    if let Some(pk) = self.partition_key.as_ref() {
-                        builder.partition(pk.data().clone());
-                        builder.partition_spec_id(pk.spec().spec_id());
-                    } else {
-                        builder.partition(Struct::empty());
-                        builder.partition_spec_id(0);
-                    }
-                    builder.build().map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Failed to build position delete file: {e}"),
-                        )
-                    })
-                })
-                .collect()
-        } else {
-            Err(Error::new(
-                ErrorKind::Unexpected,
-                "Position delete writer has been closed.",
-            ))
-        }
+        self.inner.close().await
     }
 }
-
-impl<B, L, F> CurrentFileStatus for PositionDeleteFileWriter<B, L, F>
-where
-    B: FileWriterBuilder,
-    L: LocationGenerator,
-    F: FileNameGenerator,
+impl<B: FileWriterBuilder, L: LocationGenerator, F: FileNameGenerator> CurrentFileStatus
+    for PositionDeleteFileWriter<B, L, F>
 {
     fn current_file_path(&self) -> String {
-        self.inner.as_ref().unwrap().current_file_path()
+        self.inner.current_file_path()
     }
-
     fn current_row_num(&self) -> usize {
-        self.inner
-            .as_ref()
-            .map_or(0, |inner| inner.current_row_num())
+        self.inner.current_row_num()
     }
-
     fn current_written_size(&self) -> usize {
-        self.inner
-            .as_ref()
-            .map_or(0, |inner| inner.current_written_size())
+        self.inner.current_written_size()
     }
 }
 
@@ -221,7 +131,7 @@ fn build_position_delete_batch(input: Vec<PositionDeleteInput>) -> Result<Record
         offset_column_builder.append_value(pd_input.pos);
     }
 
-    RecordBatch::try_new(Arc::clone(&POSITION_DELETE_ARROW_SCHEMA), vec![
+    RecordBatch::try_new(upstream::position_delete_arrow_schema(), vec![
         Arc::new(path_column_builder.finish()),
         Arc::new(offset_column_builder.finish()),
     ])
@@ -240,9 +150,12 @@ mod tests {
 
     use super::*;
     use crate::io::FileIO;
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+    };
     use crate::spec::{
-        DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
-        Struct, Type,
+        DataContentType, DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec,
+        PrimitiveType, Schema, Struct, Type,
     };
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
@@ -288,12 +201,12 @@ mod tests {
                 arrow_schema::Field::new("file_path", arrow_schema::DataType::Utf8, false)
                     .with_metadata(HashMap::from([(
                         PARQUET_FIELD_ID_META_KEY.to_string(),
-                        DELETE_FILE_PATH.id.to_string(),
+                        RESERVED_FIELD_ID_DELETE_FILE_PATH.to_string(),
                     )])),
                 arrow_schema::Field::new("pos", arrow_schema::DataType::Int64, false)
                     .with_metadata(HashMap::from([(
                         PARQUET_FIELD_ID_META_KEY.to_string(),
-                        DELETE_FILE_POS.id.to_string(),
+                        RESERVED_FIELD_ID_DELETE_FILE_POS.to_string(),
                     )])),
             ])),
             vec![
