@@ -826,6 +826,47 @@ mod tests {
     }
 
     #[test]
+    fn test_full_table_overwrite_resets_totals() {
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: [
+                (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+                (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+                (TOTAL_RECORDS.to_string(), "100".to_string()),
+                (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+                (TOTAL_POSITION_DELETES.to_string(), "30".to_string()),
+                (TOTAL_EQUALITY_DELETES.to_string(), "20".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: HashMap::new(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), true).unwrap();
+
+        for property in [
+            TOTAL_DATA_FILES,
+            TOTAL_DELETE_FILES,
+            TOTAL_RECORDS,
+            TOTAL_FILE_SIZE,
+            TOTAL_POSITION_DELETES,
+            TOTAL_EQUALITY_DELETES,
+        ] {
+            assert_eq!(updated.additional_properties.get(property).unwrap(), "0");
+        }
+        assert_eq!(
+            updated
+                .additional_properties
+                .get(REMOVED_POSITION_DELETES)
+                .unwrap(),
+            "30"
+        );
+    }
+
+    #[test]
     fn test_snapshot_summary_collector_build() {
         let schema = Arc::new(
             Schema::builder()

@@ -112,15 +112,22 @@ where
     <O as IntoIterator>::Item: Clone,
 {
     fn current_file_path(&self) -> String {
-        self.writer.as_ref().unwrap().current_file_path()
+        self.writer
+            .as_ref()
+            .map(CurrentFileStatus::current_file_path)
+            .unwrap_or_default()
     }
 
     fn current_row_num(&self) -> usize {
-        self.writer.as_ref().unwrap().current_row_num()
+        self.writer
+            .as_ref()
+            .map_or(0, CurrentFileStatus::current_row_num)
     }
 
     fn current_written_size(&self) -> usize {
-        self.writer.as_ref().unwrap().current_written_size()
+        self.writer
+            .as_ref()
+            .map_or(0, CurrentFileStatus::current_written_size)
     }
 }
 
@@ -191,6 +198,14 @@ mod tests {
         let writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
         let mut writer = UnpartitionedWriter::new(writer_builder);
+        assert_eq!(
+            (
+                writer.current_file_path(),
+                writer.current_row_num(),
+                writer.current_written_size()
+            ),
+            (String::new(), 0, 0),
+        );
 
         // Write two batches
         let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![

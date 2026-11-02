@@ -389,6 +389,50 @@ mod tests {
         ManifestStatus, Struct,
     };
 
+    #[tokio::test]
+    async fn test_delete_file_index_ready_before_lookup() {
+        let (index, sender) = DeleteFileIndex::new(Runtime::current());
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    *index.state.read().unwrap(),
+                    DeleteFileIndexState::Populated(_)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let deletes = index
+                .get_deletes_for_data_file(&build_unpartitioned_data_file(), None)
+                .await
+                .unwrap();
+            assert!(deletes.is_empty());
+        })
+        .await
+        .expect("lookup missed an already-published ready state");
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_index_serves_concurrent_lookups() {
+        let (index, sender) = DeleteFileIndex::new(Runtime::current());
+        let data_file = build_unpartitioned_data_file();
+        let first = index.get_deletes_for_data_file(&data_file, None);
+        let second = index.get_deletes_for_data_file(&data_file, None);
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(sender);
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(first, second)
+        })
+        .await
+        .expect("delete file index waiters timed out")
+        .unwrap();
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
+
     #[test]
     fn test_delete_file_index_unpartitioned() {
         let deletes: Vec<ManifestEntry> = vec![

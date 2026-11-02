@@ -226,6 +226,35 @@ pub(crate) async fn validate_files_not_live(table: &Table, data_files: &[DataFil
     Ok(())
 }
 
+fn partition_schema(
+    table: &Table,
+    partition_spec: &PartitionSpecRef,
+    partition: &Struct,
+) -> SchemaRef {
+    let metadata = table.metadata();
+    let fits = |schema: &SchemaRef| {
+        partition_spec
+            .fields()
+            .iter()
+            .all(|field| schema.field_by_id(field.source_id).is_some())
+            && partition_spec
+                .partition_type(schema)
+                .is_ok_and(|partition_type| {
+                    validate_partition_value(partition, &partition_type).is_ok()
+                })
+    };
+    let current_schema = metadata.current_schema();
+    if fits(current_schema) {
+        return current_schema.clone();
+    }
+    metadata
+        .schemas_iter()
+        .filter(|schema| fits(schema))
+        .max_by_key(|schema| schema.schema_id())
+        .unwrap_or(current_schema)
+        .clone()
+}
+
 /// Builds a snapshot summary from an explicit set of file changes.
 ///
 /// User-supplied `properties` are applied first, then the computed metrics
@@ -252,37 +281,20 @@ fn build_summary(
             .unwrap_or(TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT),
     );
 
-    for data_file in added_files {
-        collector.add_file(
-            data_file,
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-        );
-    }
-
-    let mut schemas_by_spec = HashMap::new();
-    for data_file in removed_files {
-        let partition_spec = metadata
-            .partition_spec_by_id(data_file.partition_spec_id)
-            .ok_or_else(|| {
-                invalid_data!("Unknown partition spec id {}", data_file.partition_spec_id)
-            })?;
-        // A dropped source column keeps its type, such as a decimal's scale, only in an
-        // older schema.
-        let schema = schemas_by_spec
-            .entry(data_file.partition_spec_id)
-            .or_insert_with(|| {
-                metadata
-                    .schemas_iter()
-                    .filter(|schema| {
-                        let mut source_ids = partition_spec.fields().iter().map(|f| f.source_id);
-                        source_ids.all(|id| schema.field_by_id(id).is_some())
-                    })
-                    .max_by_key(|schema| schema.schema_id())
-                    .unwrap_or(metadata.current_schema())
-                    .clone()
-            });
-        collector.remove_file(data_file, schema.clone(), partition_spec.clone());
+    for (files, added) in [(added_files, true), (removed_files, false)] {
+        for data_file in files {
+            let partition_spec = metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    invalid_data!("Unknown partition spec id {}", data_file.partition_spec_id)
+                })?;
+            let schema = partition_schema(table, partition_spec, data_file.partition());
+            if added {
+                collector.add_file(data_file, schema, partition_spec.clone());
+            } else {
+                collector.remove_file(data_file, schema, partition_spec.clone());
+            }
+        }
     }
 
     properties.extend(collector.build());

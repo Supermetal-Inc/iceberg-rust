@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestEntry, ManifestFile,
-    ManifestStatus, Operation,
+    Operation,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::changes::{
@@ -101,7 +101,10 @@ impl RowDeltaAction {
         self
     }
 
-    fn validate_delete_files(files: &[DataFile], label: &str) -> Result<()> {
+    pub(crate) fn validate_delete_files<'a>(
+        files: impl IntoIterator<Item = &'a DataFile>,
+        label: &str,
+    ) -> Result<()> {
         for file in files {
             match file.content_type() {
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {}
@@ -127,7 +130,10 @@ impl RowDeltaAction {
         Ok(())
     }
 
-    fn validate_format_version(files: &[DataFile], format: FormatVersion) -> Result<()> {
+    pub(crate) fn validate_format_version<'a>(
+        files: impl IntoIterator<Item = &'a DataFile>,
+        format: FormatVersion,
+    ) -> Result<()> {
         for file in files {
             if format == FormatVersion::V1 {
                 return Err(Error::new(
@@ -209,7 +215,7 @@ impl TransactionAction for RowDeltaAction {
         );
 
         snapshot_producer.validate_added_data_files(&self.added_data_files)?;
-        snapshot_producer.validate_added_data_files(&self.added_delete_files)?;
+        snapshot_producer.validate_added_delete_files()?;
 
         if self.check_duplicate {
             snapshot_producer.validate_duplicate_files().await?;
@@ -248,130 +254,14 @@ impl SnapshotProduceOperation for RowDeltaOperation {
         &self,
         snapshot_producer: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestEntry>> {
-        if snapshot_producer.deleted_delete_files.is_empty() {
-            return Ok(vec![]);
-        }
-        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_producer
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
-        let removed_paths: HashSet<&str> = snapshot_producer
-            .deleted_delete_files
-            .iter()
-            .map(|f| f.file_path())
-            .collect();
-
-        let mut entries = Vec::with_capacity(snapshot_producer.deleted_delete_files.len());
-        for manifest_file in manifest_list.entries() {
-            let manifest = snapshot_producer
-                .table
-                .object_cache()
-                .get_manifest(manifest_file)
-                .await?;
-            for entry in manifest.entries() {
-                if !entry.is_alive() {
-                    continue;
-                }
-                if !matches!(
-                    entry.content_type(),
-                    DataContentType::PositionDeletes | DataContentType::EqualityDeletes
-                ) {
-                    continue;
-                }
-                if removed_paths.contains(entry.data_file().file_path()) {
-                    entries.push(entry.as_ref().clone());
-                }
-            }
-        }
-        Ok(entries)
+        snapshot_producer.delete_entries(false).await
     }
 
     async fn existing_manifest(
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_producer
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
-        if snapshot_producer.deleted_delete_files.is_empty() {
-            return Ok(manifest_list
-                .entries()
-                .iter()
-                .filter(|entry| entry.has_added_files() || entry.has_existing_files())
-                .cloned()
-                .collect());
-        }
-
-        let removed_paths: HashSet<String> = snapshot_producer
-            .deleted_delete_files
-            .iter()
-            .map(|f| f.file_path().to_string())
-            .collect();
-
-        let mut existing = Vec::new();
-        for manifest_file in manifest_list.entries() {
-            let manifest = snapshot_producer
-                .table
-                .object_cache()
-                .get_manifest(manifest_file)
-                .await?;
-
-            let mut has_removal = false;
-            let mut has_survivor = false;
-            for entry in manifest.entries() {
-                if entry.status() == ManifestStatus::Deleted {
-                    continue;
-                }
-                if removed_paths.contains(entry.data_file().file_path()) {
-                    has_removal = true;
-                } else {
-                    has_survivor = true;
-                }
-            }
-
-            if !has_removal {
-                if manifest_file.has_added_files() || manifest_file.has_existing_files() {
-                    existing.push(manifest_file.clone());
-                }
-                continue;
-            }
-
-            // Skip the rewrite when every live entry would be dropped.
-            // `delete_entries` emits the DELETED rows separately.
-            if !has_survivor {
-                continue;
-            }
-
-            // Preserve `manifest_file.content` so deletes manifests stay
-            // deletes after the rewrite. `add_existing_entry` keeps each
-            // survivor's original snapshot id and sequence numbers.
-            let mut writer = snapshot_producer
-                .new_manifest_writer(manifest_file.content, manifest_file.partition_spec_id)?;
-            for entry in manifest.entries() {
-                if entry.status() == ManifestStatus::Deleted {
-                    continue;
-                }
-                if removed_paths.contains(entry.data_file().file_path()) {
-                    continue;
-                }
-                writer.add_existing_entry((**entry).clone())?;
-            }
-            existing.push(writer.write_manifest_file().await?);
-        }
-        Ok(existing)
+        snapshot_producer.existing_manifests().await
     }
 }
 
@@ -381,9 +271,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, ManifestStatus,
-        Operation, Struct,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
+        MAIN_BRANCH, ManifestStatus, Operation, Struct,
     };
+    use crate::table::Table;
     use crate::transaction::Transaction;
     use crate::transaction::tests::{
         commit_action, data_file, first_snapshot, make_v2_minimal_table, pos_delete_v2,
@@ -488,7 +379,7 @@ mod tests {
     async fn v3_rejects_parquet_position_deletes() {
         let table = make_v2_minimal_table();
         let mut metadata = (*table.metadata_ref()).clone();
-        metadata.format_version = crate::spec::FormatVersion::V3;
+        metadata.format_version = FormatVersion::V3;
         let table = table.with_metadata(Arc::new(metadata));
 
         let tx = Transaction::new(&table);
@@ -713,5 +604,548 @@ mod tests {
             first_manifests.entries()[0].manifest_path,
             second_manifests.entries()[0].manifest_path
         );
+    }
+    fn deletion_vector(path: &str, offset: i64, data_file: &str, table: &Table) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(500)
+            .record_count(3)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .referenced_data_file(Some(data_file.to_string()))
+            .content_offset(Some(offset))
+            .content_size_in_bytes(Some(40))
+            .build()
+            .unwrap()
+    }
+
+    /// A v3 table whose current snapshot holds the deletion vectors for `a.parquet` and
+    /// `b.parquet` in one Puffin file, as Java's writer produces.
+    async fn table_with_shared_puffin() -> (Table, DataFile, DataFile) {
+        let table = make_v2_minimal_table();
+        let mut metadata = (*table.metadata_ref()).clone();
+        metadata.format_version = FormatVersion::V3;
+        let base = table.with_metadata(Arc::new(metadata));
+        let dv_a = deletion_vector("test/shared.puffin", 4, "test/a.parquet", &base);
+        let dv_b = deletion_vector("test/shared.puffin", 44, "test/b.parquet", &base);
+        let mut commit = commit_action(
+            Transaction::new(&base)
+                .row_delta()
+                .add_delete_files(vec![dv_a.clone(), dv_b.clone()]),
+            &base,
+        )
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
+        (table, dv_a, dv_b)
+    }
+
+    #[tokio::test]
+    async fn removes_one_deletion_vector_from_a_shared_puffin_file() {
+        let (table, dv_a, dv_b) = table_with_shared_puffin().await;
+        let replacement = deletion_vector("test/new.puffin", 4, "test/a.parquet", &table);
+
+        // Identified by content offset, as a delete file read from a manifest is.
+        let mut by_offset = dv_a.clone();
+        by_offset.referenced_data_file = None;
+        // Identified by referenced data file.
+        let mut by_reference = dv_a.clone();
+        by_reference.content_offset = None;
+
+        for removal in [by_offset, by_reference] {
+            let mut commit = commit_action(
+                Transaction::new(&table)
+                    .row_delta()
+                    .add_delete_files(vec![replacement.clone()])
+                    .remove_delete_files(vec![removal]),
+                &table,
+            )
+            .await
+            .unwrap();
+            let snapshot = first_snapshot(commit.take_updates());
+
+            let manifest_list = table
+                .manifest_list_reader(&Arc::new(snapshot))
+                .load()
+                .await
+                .unwrap();
+            let mut statuses = Vec::new();
+            for manifest_file in manifest_list.entries() {
+                let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+                for entry in manifest.entries() {
+                    statuses.push((
+                        entry.file_path().to_string(),
+                        entry.data_file().content_offset(),
+                        entry.status(),
+                    ));
+                }
+            }
+            statuses.sort_by_key(|(path, offset, _)| (path.clone(), *offset));
+            assert_eq!(statuses, vec![
+                (
+                    "test/new.puffin".to_string(),
+                    Some(4),
+                    ManifestStatus::Added
+                ),
+                (
+                    "test/shared.puffin".to_string(),
+                    Some(4),
+                    ManifestStatus::Deleted
+                ),
+                (
+                    "test/shared.puffin".to_string(),
+                    Some(44),
+                    ManifestStatus::Existing
+                ),
+            ]);
+            assert_eq!(dv_b.content_offset(), Some(44));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_ambiguous_path_only_removal() {
+        let (table, dv_a, _) = table_with_shared_puffin().await;
+        let mut path_only = dv_a;
+        path_only.referenced_data_file = None;
+        path_only.content_offset = None;
+
+        let result = commit_action(
+            Transaction::new(&table)
+                .row_delta()
+                .remove_delete_files(vec![path_only]),
+            &table,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected an ambiguous removal to be rejected"),
+        };
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn adds_delete_files_under_their_own_partition_spec() {
+        use crate::spec::{
+            TableMetadataBuilder, Transform, UnboundPartitionField, UnboundPartitionSpec,
+        };
+
+        // The default spec moves from identity(x) to identity(y), identity(z).
+        let base = make_v2_minimal_table();
+        let field = |source_id, name: &str| {
+            UnboundPartitionField::builder()
+                .source_ids(vec![source_id])
+                .name(name)
+                .transform(Transform::Identity)
+                .build()
+                .unwrap()
+        };
+        let metadata = TableMetadataBuilder::new_from_metadata(base.metadata().clone(), None)
+            .add_partition_spec(
+                UnboundPartitionSpec::builder()
+                    .add_partition_fields([field(2, "y"), field(3, "z")])
+                    .unwrap()
+                    .build(),
+            )
+            .unwrap()
+            .set_default_partition_spec(TableMetadataBuilder::LAST_ADDED)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.clone().with_metadata(Arc::new(metadata));
+        let default_spec_id = table.metadata().default_partition_spec_id();
+        assert_ne!(default_spec_id, 0);
+
+        // Deletes for data written under spec 0 keep spec 0 and its partition value, next to
+        // deletes for data written under the default spec.
+        let old_spec_delete = pos_delete_v2("test/old-spec-delete.parquet", &base);
+        let mut new_spec_delete = pos_delete_v2("test/new-spec-delete.parquet", &table);
+        new_spec_delete.partition =
+            Struct::from_iter([Some(Literal::long(1)), Some(Literal::long(2))]);
+        let mut commit = commit_action(
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files(vec![old_spec_delete.clone(), new_spec_delete]),
+            &table,
+        )
+        .await
+        .unwrap();
+        let snapshot = first_snapshot(commit.take_updates());
+        let snapshot_clone = snapshot.clone();
+
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot))
+            .load()
+            .await
+            .unwrap();
+        let mut specs = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                assert_eq!(
+                    entry.data_file().partition_spec_id,
+                    manifest_file.partition_spec_id
+                );
+                specs.push((
+                    entry.file_path().to_string(),
+                    manifest_file.partition_spec_id,
+                    entry.data_file().partition().clone(),
+                ));
+            }
+        }
+        specs.sort_by_key(|(path, _, _)| path.clone());
+        assert_eq!(specs, vec![
+            (
+                "test/new-spec-delete.parquet".to_string(),
+                default_spec_id,
+                Struct::from_iter([Some(Literal::long(1)), Some(Literal::long(2))]),
+            ),
+            (
+                "test/old-spec-delete.parquet".to_string(),
+                0,
+                old_spec_delete.partition().clone(),
+            ),
+        ]);
+
+        // The old-spec delete applies to data of spec 0 in its partition.
+        let snapshot = table_with_snapshot(&table, snapshot_clone)
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .clone();
+        let applicable = deletes_for(
+            &table,
+            &snapshot,
+            &data_file("test/old-data.parquet", &base),
+            0,
+        )
+        .await;
+        assert_eq!(applicable, vec![old_spec_delete.file_path().to_string()]);
+
+        let mut wrong_value = old_spec_delete;
+        wrong_value.partition = Struct::from_iter([Some(Literal::string("not a long"))]);
+        assert!(
+            commit_action(
+                Transaction::new(&table)
+                    .row_delta()
+                    .add_delete_files(vec![wrong_value]),
+                &table
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// An equality delete written after its partition source and equality column were both
+    /// promoted from int to long keeps the data's int partition value, so it is written under
+    /// the int schema. Its long bounds cannot be encoded there and are dropped, leaving the
+    /// manifest readable and the delete applicable to the data written before the promotion.
+    #[tokio::test]
+    async fn equality_delete_written_after_a_type_promotion() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use futures::SinkExt;
+        use parquet::file::properties::WriterProperties;
+
+        use crate::TableIdent;
+        use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+        use crate::delete_file_index::DeleteFileIndex;
+        use crate::io::FileIO;
+        use crate::scan::DeleteFileContext;
+        use crate::spec::{
+            Datum, ManifestContentType, NestedField, PartitionKey, PrimitiveType, Schema,
+            SortOrder, TableMetadataBuilder, Transform, Type, UnboundPartitionField,
+            UnboundPartitionSpec,
+        };
+        use crate::test_utils::test_runtime;
+        use crate::writer::base_writer::equality_delete_writer::{
+            EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+        };
+        use crate::writer::file_writer::ParquetWriterBuilder;
+        use crate::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+        let schema = |schema_id, field_type: PrimitiveType| {
+            Schema::builder()
+                .with_schema_id(schema_id)
+                .with_fields(vec![
+                    NestedField::required(1, "x", Type::Primitive(field_type.clone())).into(),
+                    NestedField::required(2, "y", Type::Primitive(field_type)).into(),
+                ])
+                .build()
+                .unwrap()
+        };
+        let metadata = TableMetadataBuilder::new(
+            schema(0, PrimitiveType::Int),
+            UnboundPartitionSpec::builder()
+                .add_partition_fields([UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .name("x")
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap()])
+                .unwrap()
+                .build(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/t".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table = Table::builder()
+            .metadata(metadata)
+            .metadata_location("memory://warehouse/t/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns", "t"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap();
+
+        // Data written while x and y are ints.
+        let data = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("memory://warehouse/t/data/old.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(10)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::int(100))]))
+            .build()
+            .unwrap();
+        let mut commit = commit_action(
+            Transaction::new(&table)
+                .fast_append()
+                .add_data_files([data]),
+            &table,
+        )
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&table, first_snapshot(commit.take_updates()));
+
+        // x and y are promoted to long.
+        let metadata = TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+            .add_current_schema(schema(1, PrimitiveType::Long))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = table.with_metadata(Arc::new(metadata));
+        let current_schema = table.metadata().current_schema().clone();
+
+        // A real equality delete on y, written under the current schema with the old data's
+        // partition key, which is bound to the schema that data was written under.
+        let config = EqualityDeleteWriterConfig::new(vec![2], current_schema.clone()).unwrap();
+        let delete_schema = arrow_schema_to_schema(config.projected_arrow_schema_ref()).unwrap();
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(delete_schema)),
+            table.file_io().clone(),
+            DefaultLocationGenerator::with_data_location("memory://warehouse/t/data".to_string()),
+            DefaultFileNameGenerator::new("eq".to_string(), None, DataFileFormat::Parquet),
+        );
+        let partition_key = PartitionKey::new(
+            table
+                .metadata()
+                .partition_spec_by_id(0)
+                .unwrap()
+                .as_ref()
+                .clone(),
+            table.metadata().schema_by_id(0).unwrap().clone(),
+            Struct::from_iter([Some(Literal::int(100))]),
+        );
+        let mut writer = EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config)
+            .build(Some(partition_key))
+            .await
+            .unwrap();
+        writer
+            .write(
+                RecordBatch::try_new(
+                    Arc::new(schema_to_arrow_schema(&current_schema).unwrap()),
+                    vec![
+                        Arc::new(Int64Array::from(vec![100])),
+                        Arc::new(Int64Array::from(vec![10])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delete = writer.close().await.unwrap().pop().unwrap();
+        assert_eq!(delete.lower_bounds().get(&2), Some(&Datum::long(10)));
+
+        let mut commit = commit_action(
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([delete]),
+            &table,
+        )
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&table, first_snapshot(commit.take_updates()));
+
+        // Every manifest reads back.
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let mut data_entries = Vec::new();
+        let mut delete_contexts = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                assert_eq!(
+                    entry.data_file().partition(),
+                    &Struct::from_iter([Some(Literal::int(100))])
+                );
+                match manifest_file.content {
+                    ManifestContentType::Data => data_entries.push(entry.clone()),
+                    ManifestContentType::Deletes => {
+                        assert!(entry.data_file().lower_bounds().get(&2).is_none());
+                        delete_contexts.push(DeleteFileContext {
+                            manifest_entry: entry.clone(),
+                            partition_spec_id: entry.data_file().partition_spec_id,
+                        });
+                    }
+                }
+            }
+        }
+        assert_eq!((data_entries.len(), delete_contexts.len()), (1, 1));
+
+        // The delete applies to the data written before the promotion.
+        let (index, mut sender) = DeleteFileIndex::new(table.runtime().clone());
+        for context in delete_contexts {
+            sender.send(context).await.unwrap();
+        }
+        drop(sender);
+        let deletes = index
+            .get_deletes_for_data_file(
+                data_entries[0].data_file(),
+                data_entries[0].sequence_number(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deletes.len(), 1);
+    }
+
+    /// Paths of the delete files in `snapshot` that apply to `data_file` with data sequence
+    /// number `sequence_number`, as a scan finds them.
+    async fn deletes_for(
+        table: &Table,
+        snapshot: &crate::spec::SnapshotRef,
+        data_file: &DataFile,
+        sequence_number: i64,
+    ) -> Vec<String> {
+        use futures::SinkExt;
+
+        use crate::delete_file_index::DeleteFileIndex;
+        use crate::scan::DeleteFileContext;
+        use crate::spec::ManifestContentType;
+
+        let (index, mut sender) = DeleteFileIndex::new(table.runtime().clone());
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Deletes {
+                continue;
+            }
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                sender
+                    .send(DeleteFileContext {
+                        manifest_entry: entry.clone(),
+                        partition_spec_id: entry.data_file().partition_spec_id,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(sender);
+        let mut paths: Vec<String> = index
+            .get_deletes_for_data_file(data_file, Some(sequence_number))
+            .await
+            .unwrap()
+            .iter()
+            .map(|delete| delete.file_path().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn rewrites_manifests_of_an_encrypted_table_encrypted() {
+        let base = crate::test_utils::make_encrypted_table().await;
+        assert!(base.encryption_manager().is_some());
+        let dv = |path: &str, data: &str| {
+            DataFileBuilder::default()
+                .content(DataContentType::PositionDeletes)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Puffin)
+                .file_size_in_bytes(50)
+                .record_count(1)
+                .partition_spec_id(base.metadata().default_partition_spec_id())
+                .partition(Struct::empty())
+                .referenced_data_file(Some(data.to_string()))
+                .content_offset(Some(4))
+                .content_size_in_bytes(Some(40))
+                .build()
+                .unwrap()
+        };
+        let dv_a = dv(
+            "memory:///table/dv-a.puffin",
+            "memory:///table/data/a.parquet",
+        );
+        let dv_b = dv(
+            "memory:///table/dv-b.puffin",
+            "memory:///table/data/b.parquet",
+        );
+        let replacement = dv(
+            "memory:///table/dv-a2.puffin",
+            "memory:///table/data/a.parquet",
+        );
+
+        let mut commit = commit_action(
+            Transaction::new(&base)
+                .row_delta()
+                .add_delete_files(vec![dv_a.clone(), dv_b.clone()]),
+            &base,
+        )
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
+
+        // Replacing a's vector rewrites the manifest holding both into one keeping b.
+        let mut commit = commit_action(
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files(vec![replacement.clone()])
+                .remove_delete_files(vec![dv_a.clone()]),
+            &table,
+        )
+        .await
+        .unwrap();
+        let snapshot = Arc::new(first_snapshot(commit.take_updates()));
+
+        let manifest_list = table.manifest_list_reader(&snapshot).load().await.unwrap();
+        let mut statuses = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            assert!(
+                manifest_file.key_metadata.is_some(),
+                "manifest {} is not encrypted",
+                manifest_file.manifest_path
+            );
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                statuses.push((entry.file_path().to_string(), entry.status()));
+            }
+        }
+        statuses.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(statuses, vec![
+            (dv_a.file_path().to_string(), ManifestStatus::Deleted),
+            (replacement.file_path().to_string(), ManifestStatus::Added),
+            (dv_b.file_path().to_string(), ManifestStatus::Existing),
+        ]);
     }
 }

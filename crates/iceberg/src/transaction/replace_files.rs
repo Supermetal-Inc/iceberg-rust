@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
@@ -205,6 +205,9 @@ impl<M: ReplaceFilesMode> TransactionAction for ReplaceFilesAction<M> {
             self.deleted_delete_files.clone(),
         );
 
+        snapshot_producer.validate_added_data_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_delete_files()?;
+
         let replace_operation = ReplaceFilesOperation::<M> {
             added_data_files: self.added_data_files.clone(),
             added_delete_files: self.added_delete_files.clone(),
@@ -246,7 +249,7 @@ impl<M: ReplaceFilesMode> SnapshotValidator for ReplaceFilesOperation<M> {
         // todo add use_starting_seq_number to determine if we want to use data_sequence_number
         // If there are replaced data files, there cannot be any new row-level deletes for those data files
         if !self.deleted_data_files.is_empty() {
-            self.validate_no_new_deletes_for_data_files(
+            super::validate::validate_no_new_deletes_for_data_files(
                 base,
                 self.starting_snapshot_id,
                 parent_snapshot_id,
@@ -273,148 +276,36 @@ impl<M: ReplaceFilesMode> SnapshotProduceOperation for ReplaceFilesOperation<M> 
         &self,
         snapshot_producer: &SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestEntry>> {
-        // Find entries that are associated with deleted files
-        let snapshot = snapshot_producer.table.metadata().current_snapshot();
-
-        if let Some(snapshot) = snapshot {
-            let manifest_list = snapshot_producer
-                .table
-                .manifest_list_reader(snapshot)
-                .load()
-                .await?;
-
-            let mut delete_entries = Vec::new();
-
-            for manifest_file in manifest_list.entries() {
-                let manifest = snapshot_producer
-                    .table
-                    .object_cache()
-                    .get_manifest(manifest_file)
-                    .await?;
-
-                for entry in manifest.entries() {
-                    match entry.content_type() {
-                        DataContentType::Data => {
-                            if snapshot_producer
-                                .deleted_data_files
-                                .iter()
-                                .any(|f| f.file_path == entry.data_file().file_path)
-                            {
-                                delete_entries.push(entry.as_ref().clone())
-                            }
-                        }
-                        DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                            if snapshot_producer
-                                .deleted_delete_files
-                                .iter()
-                                .any(|f| f.file_path == entry.data_file().file_path)
-                            {
-                                delete_entries.push(entry.as_ref().clone())
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(delete_entries)
-        } else {
-            Ok(vec![])
-        }
+        snapshot_producer
+            .delete_entries(self.full_table_overwrite)
+            .await
     }
 
     async fn existing_manifest(
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_producer.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_producer
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
-        let mut existing_files = Vec::new();
-
-        for manifest_file in manifest_list.entries() {
-            let manifest = snapshot_producer
-                .table
-                .object_cache()
-                .get_manifest(manifest_file)
-                .await?;
-
-            // Find files to delete from the current manifest entries
-            let found_files_to_delete: HashSet<_> = manifest
-                .entries()
-                .iter()
-                .filter_map(|entry| {
-                    match entry.content_type() {
-                        DataContentType::Data => {
-                            if snapshot_producer
-                                .deleted_data_files
-                                .iter()
-                                .any(|f| f.file_path == entry.data_file().file_path)
-                            {
-                                return Some(entry.data_file().file_path().to_string());
-                            }
-                        }
-                        DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
-                            if snapshot_producer
-                                .deleted_delete_files
-                                .iter()
-                                .any(|f| f.file_path == entry.data_file().file_path)
-                            {
-                                return Some(entry.data_file().file_path().to_string());
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-
-            if found_files_to_delete.is_empty()
-                && (manifest_file.has_added_files() || manifest_file.has_existing_files())
-            {
-                // All files from the existing manifest entries are still valid
-                existing_files.push(manifest_file.clone());
-            } else if manifest.entries().iter().any(|entry| {
-                entry.is_alive() && !found_files_to_delete.contains(entry.data_file().file_path())
-            }) {
-                let mut manifest_writer = snapshot_producer
-                    .new_manifest_writer(manifest_file.content, manifest_file.partition_spec_id)?;
-
-                manifest
-                    .entries()
-                    .iter()
-                    .filter(|entry| {
-                        entry.is_alive()
-                            && !found_files_to_delete.contains(entry.data_file().file_path())
-                    })
-                    .try_for_each(|entry| manifest_writer.add_existing_entry((**entry).clone()))?;
-
-                existing_files.push(manifest_writer.write_manifest_file().await?);
-            }
-        }
-
-        Ok(existing_files)
+        snapshot_producer.existing_manifests().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{Overwrite, ReplaceFilesAction, ReplaceFilesMode, Rewrite};
-    use crate::spec::{DataFile, Operation};
+    use crate::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, ManifestStatus,
+        Operation, Snapshot, Struct,
+    };
     use crate::table::Table;
-    use crate::transaction::Transaction;
     use crate::transaction::tests::{
         commit_action, data_file, first_snapshot, make_v2_minimal_table, make_v3_minimal_table,
         pos_delete_v2, table_with_snapshot,
     };
+    use crate::transaction::{Transaction, TransactionAction};
 
     const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -452,6 +343,7 @@ mod tests {
     async fn rejects_concurrent_positional_delete() {
         assert_rejects_concurrent_positional_delete(
             false,
+            false,
             "Cannot commit, found new delete for added data file",
         )
         .await;
@@ -461,13 +353,25 @@ mod tests {
     async fn rejects_concurrent_positional_delete_with_data_sequence_number() {
         assert_rejects_concurrent_positional_delete(
             true,
+            false,
             "Cannot commit, found new positional delete for added data file",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_concurrent_fast_append_delete() {
+        assert_rejects_concurrent_positional_delete(
+            false,
+            true,
+            "Cannot commit, found new delete for added data file",
         )
         .await;
     }
 
     async fn assert_rejects_concurrent_positional_delete(
         set_data_sequence_number: bool,
+        fast_append: bool,
         expected_message: &str,
     ) {
         let (table_s1, existing_file) = table_with_existing_data(make_v2_minimal_table()).await;
@@ -475,13 +379,20 @@ mod tests {
         let starting_snapshot_id = starting_snapshot.snapshot_id();
         let starting_sequence_number = starting_snapshot.sequence_number();
         let concurrent_delete = pos_delete_v2("test/concurrent-delete.parquet", &table_s1);
-        let mut concurrent_commit = commit_action(
-            Transaction::new(&table_s1)
-                .row_delta()
-                .add_delete_files([concurrent_delete]),
-            &table_s1,
-        )
-        .await
+        let tx = Transaction::new(&table_s1);
+        let mut concurrent_commit = if fast_append {
+            commit_action(
+                tx.fast_append().add_data_files([concurrent_delete]),
+                &table_s1,
+            )
+            .await
+        } else {
+            commit_action(
+                tx.row_delta().add_delete_files([concurrent_delete]),
+                &table_s1,
+            )
+            .await
+        }
         .unwrap();
         let table_s2 =
             table_with_snapshot(&table_s1, first_snapshot(concurrent_commit.take_updates()));
@@ -557,5 +468,303 @@ mod tests {
         let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
 
         (table, existing_file)
+    }
+    async fn table_with_files(base: Table, paths: &[&str]) -> (Table, Vec<DataFile>) {
+        let files: Vec<DataFile> = paths.iter().map(|path| data_file(path, &base)).collect();
+        let action = Transaction::new(&base)
+            .fast_append()
+            .add_data_files(files.clone());
+        let mut commit = commit_action(action, &base).await.unwrap();
+        let table = table_with_snapshot(&base, first_snapshot(commit.take_updates()));
+
+        (table, files)
+    }
+
+    async fn entries_by_path(
+        table: &Table,
+        snapshot: &Snapshot,
+    ) -> HashMap<String, ManifestStatus> {
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        let mut entries = HashMap::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+            for entry in manifest.entries() {
+                entries.insert(entry.data_file().file_path().to_string(), entry.status());
+            }
+        }
+        entries
+    }
+
+    async fn commit_updates(table: &Table, action: impl TransactionAction + 'static) -> Table {
+        let mut commit = tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, table))
+            .await
+            .expect("commit timed out")
+            .unwrap();
+        table_with_snapshot(table, first_snapshot(commit.take_updates()))
+    }
+
+    async fn overwrite_error(table: &Table, action: super::OverwriteFilesAction) -> String {
+        match tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, table))
+            .await
+            .expect("overwrite timed out")
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected the overwrite to be rejected"),
+        }
+    }
+
+    fn file_in_partition(path: &str, content: DataContentType, table: &Table) -> DataFile {
+        DataFileBuilder::default()
+            .content(content)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(50)
+            .record_count(5)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(200))]))
+            .build()
+            .unwrap()
+    }
+
+    fn deletion_vector(path: &str, data_file: &str, table: &Table) -> DataFile {
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(50)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .referenced_data_file(Some(data_file.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_table_overwrite_resets_totals() {
+        let (table, files) = table_with_files(make_v2_minimal_table(), &[
+            "test/a.parquet",
+            "test/b.parquet",
+        ])
+        .await;
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .set_snapshot_properties(truncate_snapshot_properties(&table))
+            .delete_data_files(files)
+            .unwrap()
+            .full_table_overwrite();
+
+        let mut commit = tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, &table))
+            .await
+            .expect("overwrite validation timed out")
+            .unwrap();
+        let snapshot = first_snapshot(commit.take_updates());
+        let properties = &snapshot.summary().additional_properties;
+        assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+        assert_eq!(properties.get("deleted-data-files").unwrap(), "2");
+        assert_eq!(properties.get("deleted-records").unwrap(), "20");
+        assert_eq!(properties.get("total-data-files").unwrap(), "0");
+        assert_eq!(properties.get("total-records").unwrap(), "0");
+
+        let entries = entries_by_path(&table, &snapshot).await;
+        assert_eq!(
+            entries,
+            HashMap::from([
+                ("test/a.parquet".to_string(), ManifestStatus::Deleted),
+                ("test/b.parquet".to_string(), ManifestStatus::Deleted),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_overwrite_keeps_other_files() {
+        let (table, mut files) = table_with_files(make_v2_minimal_table(), &[
+            "test/a.parquet",
+            "test/b.parquet",
+        ])
+        .await;
+        let replacement = data_file("test/c.parquet", &table);
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .delete_data_files([files.remove(0)])
+            .unwrap()
+            .add_data_files([replacement])
+            .unwrap();
+
+        let mut commit = tokio::time::timeout(VALIDATION_TIMEOUT, commit_action(action, &table))
+            .await
+            .expect("overwrite validation timed out")
+            .unwrap();
+        let snapshot = first_snapshot(commit.take_updates());
+        let properties = &snapshot.summary().additional_properties;
+        assert_eq!(properties.get("total-data-files").unwrap(), "2");
+        assert_eq!(properties.get("total-records").unwrap(), "20");
+
+        let entries = entries_by_path(&table, &snapshot).await;
+        assert_eq!(
+            entries,
+            HashMap::from([
+                ("test/a.parquet".to_string(), ManifestStatus::Deleted),
+                ("test/b.parquet".to_string(), ManifestStatus::Existing),
+                ("test/c.parquet".to_string(), ManifestStatus::Added),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn full_overwrite_rejects_files_it_does_not_delete() {
+        let (table, files) = table_with_files(make_v2_minimal_table(), &["test/a.parquet"]).await;
+        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // A file appended after the caller listed the table's files.
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .fast_append()
+                .add_data_files([data_file("test/b.parquet", &table)]),
+        )
+        .await;
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .set_starting_snapshot_id(starting_snapshot_id)
+            .delete_data_files(files)
+            .unwrap()
+            .full_table_overwrite();
+        let error = overwrite_error(&table, action).await;
+        assert!(error.contains("must delete every live file"), "{error}");
+        assert!(error.contains("test/b.parquet"), "{error}");
+
+        // A delete list naming files the table no longer has.
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .delete_data_files([data_file("test/gone.parquet", &table)])
+            .unwrap()
+            .full_table_overwrite();
+        let error = overwrite_error(&table, action).await;
+        assert!(error.contains("must delete every live file"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn validation_ignores_a_replaced_deletion_vector_of_another_file() {
+        let (table, mut files) = table_with_files(make_v3_minimal_table(), &[
+            "test/a.parquet",
+            "test/b.parquet",
+        ])
+        .await;
+        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // b's deletion vector is added and then replaced by a newer one.
+        let first_dv = deletion_vector("test/first.puffin", "test/b.parquet", &table);
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([first_dv.clone()]),
+        )
+        .await;
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([deletion_vector(
+                    "test/second.puffin",
+                    "test/b.parquet",
+                    &table,
+                )])
+                .remove_delete_files([first_dv]),
+        )
+        .await;
+
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .set_starting_snapshot_id(starting_snapshot_id)
+            .delete_data_files([files.remove(0)])
+            .unwrap();
+        commit_updates(&table, action).await;
+    }
+
+    #[tokio::test]
+    async fn validation_ignores_deletes_that_predate_the_starting_snapshot() {
+        let (table, mut files) =
+            table_with_files(make_v2_minimal_table(), &["test/a.parquet"]).await;
+        // Deletes in a's partition and in another one, committed before the starting snapshot.
+        let old_delete = pos_delete_v2("test/old-delete.parquet", &table);
+        let other_delete = file_in_partition(
+            "test/other-delete.parquet",
+            DataContentType::PositionDeletes,
+            &table,
+        );
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([old_delete.clone(), other_delete.clone()]),
+        )
+        .await;
+        let starting_snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+
+        // A later delete snapshot carries `old_delete` forward as EXISTING in a rewritten
+        // manifest, and adds a delete in the other partition only.
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([file_in_partition(
+                    "test/new-other-delete.parquet",
+                    DataContentType::PositionDeletes,
+                    &table,
+                )])
+                .remove_delete_files([other_delete]),
+        )
+        .await;
+        // Another removes `old_delete`, leaving it DELETED.
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([file_in_partition(
+                    "test/newest-other-delete.parquet",
+                    DataContentType::PositionDeletes,
+                    &table,
+                )])
+                .remove_delete_files([old_delete]),
+        )
+        .await;
+
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .set_starting_snapshot_id(starting_snapshot_id)
+            .delete_data_files([files.remove(0)])
+            .unwrap();
+        commit_updates(&table, action).await;
+    }
+
+    #[tokio::test]
+    async fn validates_added_delete_files() {
+        let (table, files) = table_with_files(make_v3_minimal_table(), &["test/a.parquet"]).await;
+        let dv = deletion_vector("test/dv.puffin", files[0].file_path(), &table);
+        let table = commit_updates(
+            &table,
+            Transaction::new(&table)
+                .row_delta()
+                .add_delete_files([dv.clone()]),
+        )
+        .await;
+
+        // v3 position deletes must be deletion vectors.
+        let action = Transaction::new(&table)
+            .overwrite_files()
+            .delete_data_files([dv])
+            .unwrap()
+            .add_data_files([pos_delete_v2("test/parquet-delete.parquet", &table)])
+            .unwrap();
+        let error = overwrite_error(&table, action).await;
+        assert!(error.contains("V3 requires deletion vectors"), "{error}");
     }
 }

@@ -153,6 +153,17 @@ async fn test_add_field() {
     let table = tx.commit(&rest_catalog).await.unwrap();
 
     // Verify existing data is still readable after schema evolution
+    let evolved_schema = Arc::new(
+        table
+            .metadata()
+            .current_schema()
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+    let mut expected_columns = batch.columns().to_vec();
+    expected_columns.push(Arc::new(Int32Array::new_null(batch.num_rows())));
+    let expected = RecordBatch::try_new(evolved_schema, expected_columns).unwrap();
     let batch_stream = table
         .scan()
         .select_all()
@@ -163,7 +174,7 @@ async fn test_add_field() {
         .unwrap();
     let batches: Vec<_> = batch_stream.try_collect().await.unwrap();
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0], batch);
+    assert_eq!(batches[0], expected);
 
     // Add a struct column, then add a nested column inside it
     let tx = Transaction::new(&table);

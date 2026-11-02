@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::error::{Result, invalid_data};
-use crate::spec::{DataContentType, DataFile};
+use crate::error::Result;
+use crate::spec::DataFile;
 use crate::table::Table;
 use crate::transaction::action::CommitStatus;
 use crate::transaction::snapshot::simple::{AppendIntent, SimpleSnapshotProducer};
@@ -59,7 +59,7 @@ impl FastAppendAction {
         self
     }
 
-    /// Add data files to the snapshot.
+    /// Adds data and delete files to separate manifests in an append snapshot.
     ///
     /// A path added more than once keeps its first occurrence, so a manifest
     /// never references the same file twice. This is independent of the
@@ -94,17 +94,6 @@ impl FastAppendAction {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
                 "No added data files or added snapshot properties found when write a manifest file",
-            ));
-        }
-        if let Some(data_file) = self
-            .added_data_files
-            .iter()
-            .find(|f| f.content_type() != DataContentType::Data)
-        {
-            return Err(invalid_data!(
-                "Only data content type is allowed for fast append, got {:?} for {}",
-                data_file.content_type(),
-                data_file.file_path()
             ));
         }
         Ok(())
@@ -475,8 +464,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fast_append_rejects_delete_files() {
-        let table = make_v2_minimal_table();
+    async fn test_fast_append_rejects_v1_delete_files() {
+        let table = crate::transaction::tests::make_v1_table();
         let delete_file = DataFileBuilder::default()
             .content(DataContentType::EqualityDeletes)
             .file_path("test/1-deletes.parquet".to_string())
@@ -496,6 +485,98 @@ mod tests {
             .err()
             .expect("delete files must be rejected");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_mixed_files_reuses_separate_manifests() {
+        use crate::spec::{ManifestContentType, Operation};
+        use crate::transaction::TransactionAction;
+
+        for table in [make_v2_minimal_table(), make_v3_minimal_table()] {
+            let data = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/data.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(10)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap();
+            let delete = DataFileBuilder::default()
+                .content(DataContentType::EqualityDeletes)
+                .file_path("test/deletes.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(20)
+                .record_count(1)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(data.partition().clone())
+                .equality_ids(Some(vec![1]))
+                .build()
+                .unwrap();
+            let action = Transaction::new(&table).fast_append().add_data_files([
+                data.clone(),
+                delete.clone(),
+                delete.clone(),
+            ]);
+            let mut state = action.new_state();
+            let mut previous_paths = None;
+            let mut previous_snapshot = None;
+            for _ in 0..2 {
+                let mut commit = action.commit(&mut state, &table).await.unwrap();
+                let updates = commit.take_updates();
+                let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+                    panic!("missing snapshot")
+                };
+                assert_eq!(snapshot.summary().operation, Operation::Append);
+                let props = &snapshot.summary().additional_properties;
+                assert_eq!(
+                    (
+                        props["total-data-files"].as_str(),
+                        props["total-delete-files"].as_str(),
+                        props["total-records"].as_str(),
+                        props["total-equality-deletes"].as_str()
+                    ),
+                    ("1", "1", "10", "1")
+                );
+                let manifests = table
+                    .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+                    .load()
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                for manifest in manifests.entries() {
+                    let contents = table.manifest_reader().read(manifest).await.unwrap();
+                    actual.push((
+                        manifest.content,
+                        contents
+                            .entries()
+                            .iter()
+                            .map(|entry| entry.data_file().clone())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+                let mut expected_data = data.clone();
+                if table.metadata().format_version() == crate::spec::FormatVersion::V3 {
+                    expected_data.first_row_id = Some(0);
+                }
+                assert_eq!(actual, vec![
+                    (ManifestContentType::Data, vec![expected_data]),
+                    (ManifestContentType::Deletes, vec![delete.clone()])
+                ]);
+                let paths: Vec<_> = manifests
+                    .entries()
+                    .iter()
+                    .map(|manifest| manifest.manifest_path.clone())
+                    .collect();
+                if let Some(previous) = previous_paths.replace(paths.clone()) {
+                    assert_eq!(paths, previous);
+                }
+                if let Some(previous) = previous_snapshot.replace(snapshot.snapshot_id()) {
+                    assert_eq!(snapshot.snapshot_id(), previous);
+                }
+            }
+        }
     }
 
     #[tokio::test]

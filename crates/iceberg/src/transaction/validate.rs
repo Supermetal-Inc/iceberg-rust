@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::future::Future;
 
 use futures::SinkExt;
 use futures::future::try_join_all;
-use once_cell::sync::Lazy;
 
 use crate::delete_file_index::DeleteFileIndex;
 use crate::error::Result;
@@ -32,8 +31,9 @@ use crate::table::Table;
 use crate::util::snapshot::ancestors_between;
 use crate::{Error, ErrorKind};
 
-static VALIDATE_ADDED_DELETE_FILES_OPERATIONS: Lazy<HashSet<Operation>> =
-    Lazy::new(|| HashSet::from([Operation::Overwrite, Operation::Delete]));
+/// Operations whose snapshots can add delete files that apply to existing data files.
+const VALIDATE_ADDED_DELETE_FILES_OPERATIONS: &[Operation] =
+    &[Operation::Append, Operation::Overwrite, Operation::Delete];
 
 /// A trait for validating snapshots in an Iceberg table.
 ///
@@ -52,154 +52,158 @@ pub(crate) trait SnapshotValidator {
     /// # Returns
     ///
     /// A `Result` indicating success or an error if validation fails
-    async fn validate(&self, _base: &Table, _parent_snapshot_id: Option<i64>) -> Result<()> {
-        Ok(())
+    fn validate(
+        &self,
+        _base: &Table,
+        _parent_snapshot_id: Option<i64>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+}
+
+/// Collects, for each snapshot after `from_snapshot_id` up to `to_snapshot_id` whose operation
+/// is one of `matching_operations`, the manifests of `manifest_content_type` that the snapshot
+/// added, newest snapshot first.
+///
+/// # Arguments
+///
+/// * `base` - The base table to retrieve history from
+/// * `from_snapshot_id` - The starting snapshot ID (exclusive), or None to start from the beginning
+/// * `to_snapshot_id` - The ending snapshot ID (inclusive)
+/// * `matching_operations` - Operations to match when collecting snapshots
+/// * `manifest_content_type` - The content type of manifests to collect
+///
+/// # Errors
+///
+/// Returns an error if the history between the snapshots cannot be determined
+async fn validation_history(
+    base: &Table,
+    from_snapshot_id: Option<i64>,
+    to_snapshot_id: i64,
+    matching_operations: &[Operation],
+    manifest_content_type: ManifestContentType,
+) -> Result<Vec<Vec<ManifestFile>>> {
+    let mut manifests_by_snapshot = Vec::new();
+    let mut last_snapshot: Option<SnapshotRef> = None;
+
+    let snapshots: Vec<SnapshotRef> =
+        ancestors_between(&base.metadata_ref(), to_snapshot_id, from_snapshot_id).collect();
+
+    for current_snapshot in snapshots {
+        last_snapshot = Some(current_snapshot.clone());
+
+        // Find all snapshots with the matching operations
+        // and their manifest files with the matching content type
+        if matching_operations.contains(&current_snapshot.summary().operation) {
+            let manifests = base
+                .manifest_list_reader(&current_snapshot)
+                .load()
+                .await?
+                .consume_entries()
+                .into_iter()
+                .filter(|manifest| {
+                    manifest.content == manifest_content_type
+                        && manifest.added_snapshot_id == current_snapshot.snapshot_id()
+                })
+                .collect();
+            manifests_by_snapshot.push(manifests);
+        }
     }
 
-    /// Retrieves the history of snapshots between two points with matching operations and content type.
-    ///
-    /// # Arguments
-    ///
-    /// * `base` - The base table to retrieve history from
-    /// * `from_snapshot_id` - The starting snapshot ID (exclusive), or None to start from the beginning
-    /// * `to_snapshot_id` - The ending snapshot ID (inclusive)
-    /// * `matching_operations` - Set of operations to match when collecting snapshots
-    /// * `manifest_content_type` - The content type of manifests to collect
-    ///
-    /// # Returns
-    ///
-    /// A tuple containing:
-    /// * A vector of manifest files matching the criteria
-    /// * A set of snapshot IDs that were collected
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the history between the snapshots cannot be determined
-    async fn validation_history(
-        &self,
-        base: &Table,
-        from_snapshot_id: Option<i64>,
-        to_snapshot_id: i64,
-        matching_operations: &HashSet<Operation>,
-        manifest_content_type: ManifestContentType,
-    ) -> Result<(Vec<ManifestFile>, HashSet<i64>)> {
-        let mut manifests: Vec<ManifestFile> = vec![];
-        let mut new_snapshots = HashSet::new();
-        let mut last_snapshot: Option<SnapshotRef> = None;
-
-        let metadata = base.metadata_ref();
-        let snapshots = ancestors_between(&metadata, to_snapshot_id, from_snapshot_id);
-
-        for current_snapshot in snapshots {
-            last_snapshot = Some(current_snapshot.clone());
-
-            // Find all snapshots with the matching operations
-            // and their manifest files with the matching content type
-            if matching_operations.contains(&current_snapshot.summary().operation) {
-                new_snapshots.insert(current_snapshot.snapshot_id());
-                base.manifest_list_reader(&current_snapshot)
-                    .load()
-                    .await?
-                    .entries()
-                    .iter()
-                    .for_each(|manifest| {
-                        if manifest.content == manifest_content_type
-                            && manifest.added_snapshot_id == current_snapshot.snapshot_id()
-                        {
-                            manifests.push(manifest.clone());
-                        }
-                    });
-            }
-        }
-
-        if let Some(last_snapshot) = last_snapshot
-            && last_snapshot.parent_snapshot_id() != from_snapshot_id
-        {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot determine history between starting snapshot {} and the last known ancestor {}",
-                    from_snapshot_id.unwrap_or(-1),
-                    last_snapshot.snapshot_id()
-                ),
-            ));
-        }
-
-        Ok((manifests, new_snapshots))
+    if let Some(last_snapshot) = last_snapshot
+        && last_snapshot.parent_snapshot_id() != from_snapshot_id
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Cannot determine history between starting snapshot {} and the last known ancestor {}",
+                from_snapshot_id.unwrap_or(-1),
+                last_snapshot.snapshot_id()
+            ),
+        ));
     }
 
-    /// Validates that there are no new delete files for the given data files.
-    ///
-    /// # Arguments
-    ///
-    /// * `base` - The base table to validate against
-    /// * `from_snapshot_id` - The starting snapshot ID (exclusive), or None to start from the beginning
-    /// * `to_snapshot_id` - The ending snapshot ID (inclusive), or None if there is no current table state
-    /// * `data_files` - The data files to check for conflicting delete files
-    /// * `ignore_equality_deletes` - Whether to ignore equality deletes and only check for positional deletes
-    ///
-    /// # Returns
-    ///
-    /// A `Result` indicating success or an error if validation fails
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if new delete files are found for any of the data files
-    async fn validate_no_new_deletes_for_data_files(
-        &self,
-        base: &Table,
-        from_snapshot_id: Option<i64>,
-        to_snapshot_id: Option<i64>,
-        data_files: &[DataFile],
-        ignore_equality_deletes: bool,
-    ) -> Result<()> {
-        // Without a current snapshot, the table has no files. V1 tables
-        // cannot contain row delete files.
-        if to_snapshot_id.is_none() || base.metadata().format_version() == FormatVersion::V1 {
-            return Ok(());
-        }
-        let to_snapshot_id = to_snapshot_id.unwrap();
+    Ok(manifests_by_snapshot)
+}
 
-        // Get matching delete files have been added since the from_snapshot_id
-        let (delete_manifests, _) = self
-            .validation_history(
-                base,
-                from_snapshot_id,
-                to_snapshot_id,
-                &VALIDATE_ADDED_DELETE_FILES_OPERATIONS,
-                ManifestContentType::Deletes,
-            )
-            .await?;
+/// Validates that no delete files that apply to `data_files` were added after
+/// `from_snapshot_id`.
+///
+/// # Arguments
+///
+/// * `base` - The base table to validate against
+/// * `from_snapshot_id` - The starting snapshot ID (exclusive), or None to start from the beginning
+/// * `to_snapshot_id` - The ending snapshot ID (inclusive), or None if there is no current table state
+/// * `data_files` - The data files to check for conflicting delete files
+/// * `ignore_equality_deletes` - Whether to ignore equality deletes and only check for positional deletes
+///
+/// # Errors
+///
+/// Returns an error if new delete files are found for any of the data files
+pub(crate) async fn validate_no_new_deletes_for_data_files(
+    base: &Table,
+    from_snapshot_id: Option<i64>,
+    to_snapshot_id: Option<i64>,
+    data_files: &[DataFile],
+    ignore_equality_deletes: bool,
+) -> Result<()> {
+    // Without a current snapshot, the table has no files. V1 tables
+    // cannot contain row delete files.
+    let Some(to_snapshot_id) = to_snapshot_id else {
+        return Ok(());
+    };
+    if base.metadata().format_version() == FormatVersion::V1 {
+        return Ok(());
+    }
 
-        // Build delete file index
+    // Get the delete manifests each snapshot added since the from_snapshot_id
+    let delete_manifests_by_snapshot = validation_history(
+        base,
+        from_snapshot_id,
+        to_snapshot_id,
+        VALIDATE_ADDED_DELETE_FILES_OPERATIONS,
+        ManifestContentType::Deletes,
+    )
+    .await?;
+
+    // Get starting seq num from starting snapshot if available
+    let starting_sequence_number = from_snapshot_id
+        .and_then(|id| base.metadata().snapshot_by_id(id))
+        .map_or(INITIAL_SEQUENCE_NUMBER, |snapshot| {
+            snapshot.sequence_number()
+        });
+
+    // Index each snapshot's deletes separately: deletes added by different snapshots can
+    // replace each other, such as a data file's deletion vector and the one replacing it,
+    // and an index holds at most one deletion vector per data file.
+    for delete_manifests in delete_manifests_by_snapshot {
         let (delete_file_index, mut delete_file_tx) = DeleteFileIndex::new(base.runtime().clone());
-        let cache = base.object_cache();
         let manifests = try_join_all(
             delete_manifests
                 .iter()
-                .map(|f| cache.get_manifest(f))
+                .map(|f| base.manifest_reader().read(f))
                 .collect::<Vec<_>>(),
         )
         .await?;
-        let manifest_entries = manifests.iter().flat_map(|manifest| manifest.entries());
-        for entry in manifest_entries {
+        for entry in manifests.iter().flat_map(|manifest| manifest.entries()) {
+            // Only deletes added after the starting snapshot can conflict. DELETED entries are
+            // not live, and a rewritten manifest carries older deletes forward as EXISTING
+            // entries with their original sequence numbers.
+            if !entry.is_alive()
+                || entry
+                    .sequence_number()
+                    .is_some_and(|seq| seq <= starting_sequence_number)
+            {
+                continue;
+            }
             let delete_file_ctx = DeleteFileContext {
                 manifest_entry: entry.clone(),
                 partition_spec_id: entry.data_file().partition_spec_id,
             };
             delete_file_tx.send(delete_file_ctx).await?;
         }
+        // Close the channel so the index finishes populating; lookups wait until it has.
         drop(delete_file_tx);
-
-        // Get starting seq num from starting snapshot if available
-        let starting_sequence_number = if let Some(from_snapshot_id) = from_snapshot_id {
-            match base.metadata().snapshots.get(&from_snapshot_id) {
-                Some(snapshot) => snapshot.sequence_number(),
-                None => INITIAL_SEQUENCE_NUMBER,
-            }
-        } else {
-            INITIAL_SEQUENCE_NUMBER
-        };
 
         // Validate if there are deletes using delete file index
         for data_file in data_files {
@@ -230,7 +234,7 @@ pub(crate) trait SnapshotValidator {
                 ));
             }
         }
-
-        Ok(())
     }
+
+    Ok(())
 }

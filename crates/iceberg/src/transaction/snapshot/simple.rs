@@ -27,8 +27,8 @@ use super::{
 };
 use crate::error::{Result, invalid_data};
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
+    ManifestStatus, Operation,
 };
 use crate::table::Table;
 use crate::transaction::ActionCommit;
@@ -41,7 +41,7 @@ pub(crate) struct AppendIntent {
     /// Overrides the generated commit UUID.
     pub commit_uuid: Option<Uuid>,
     pub snapshot_properties: HashMap<String, String>,
-    /// Data files to add. The action validates them before each attempt.
+    /// Data and delete files to add.
     pub data_files: Vec<DataFile>,
 }
 
@@ -84,8 +84,7 @@ pub(crate) struct SimpleSnapshotProducer {
 /// must be rewritten. The schema is not a guard: the manifest's embedded schema
 /// describes the files it was written for, which do not change.
 struct AddedManifests {
-    /// One manifest today. Several once added files are grouped by partition
-    /// spec (#3500) or rolled over at a target size (#3499).
+    /// Separate data and delete manifests.
     manifests: Vec<ManifestFile>,
     format_version: FormatVersion,
 }
@@ -188,20 +187,45 @@ impl SimpleSnapshotProducer {
         // manifest per group.
         // TODO(#3499): roll a group over at the target manifest size, and
         // write the resulting manifests concurrently.
-        let path = manifest_path(table, self.commit_uuid, self.manifest_counter)?;
-        self.manifest_counter += 1;
-        self.owned_artifacts.insert(path.clone());
-
-        let manifests = vec![
-            write_added_manifest(
-                table,
-                path,
-                snapshot_id,
-                table.metadata().default_partition_spec_id(),
-                &self.intent.data_files,
-            )
-            .await?,
-        ];
+        let mut manifests = Vec::new();
+        for content in [ManifestContentType::Data, ManifestContentType::Deletes] {
+            let files: Vec<_> = self
+                .intent
+                .data_files
+                .iter()
+                .filter(|file| {
+                    (file.content_type() == DataContentType::Data)
+                        == (content == ManifestContentType::Data)
+                })
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            if content == ManifestContentType::Deletes {
+                crate::transaction::row_delta::RowDeltaAction::validate_delete_files(
+                    files.iter().copied(),
+                    "added",
+                )?;
+                crate::transaction::row_delta::RowDeltaAction::validate_format_version(
+                    files.iter().copied(),
+                    format_version,
+                )?;
+            }
+            let path = manifest_path(table, self.commit_uuid, self.manifest_counter)?;
+            self.manifest_counter += 1;
+            self.owned_artifacts.insert(path.clone());
+            manifests.push(
+                write_added_manifest(
+                    table,
+                    path,
+                    snapshot_id,
+                    table.metadata().default_partition_spec_id(),
+                    content,
+                    &files,
+                )
+                .await?,
+            );
+        }
 
         self.added_manifests = Some(AddedManifests {
             manifests: manifests.clone(),
@@ -211,14 +235,15 @@ impl SimpleSnapshotProducer {
     }
 }
 
-/// Writes one data manifest at `path` for `data_files`, all of which must
+/// Writes one manifest at `path` for `data_files`, all of which must
 /// belong to `partition_spec_id`, and returns its manifest-list entry.
 async fn write_added_manifest(
     table: &Table,
     path: String,
     snapshot_id: i64,
     partition_spec_id: i32,
-    data_files: &[DataFile],
+    content: ManifestContentType,
+    data_files: &[&DataFile],
 ) -> Result<ManifestFile> {
     let metadata = table.metadata();
     let partition_spec = metadata
@@ -229,7 +254,7 @@ async fn write_added_manifest(
         table,
         path,
         snapshot_id,
-        ManifestContentType::Data,
+        content,
         metadata.current_schema().clone(),
         partition_spec.clone(),
     )?;
@@ -237,7 +262,7 @@ async fn write_added_manifest(
     for data_file in data_files {
         let builder = ManifestEntry::builder()
             .status(ManifestStatus::Added)
-            .data_file(data_file.clone());
+            .data_file((*data_file).clone());
         let entry = if format_version == FormatVersion::V1 {
             builder.snapshot_id(snapshot_id).build()
         } else {

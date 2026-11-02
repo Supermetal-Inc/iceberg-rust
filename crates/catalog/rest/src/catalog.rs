@@ -2545,6 +2545,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_token_expiry() {
+        let mut server = Server::new_async().await;
+        let oauth_mock = create_oauth_mock(&mut server).await;
+        let config_mock = create_config_mock(&mut server).await;
+        let before = std::time::Instant::now();
+        let catalog = RestCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([
+                    (REST_CATALOG_PROP_URI.to_string(), server.url()),
+                    ("credential".to_string(), "client1:secret1".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        let expires_at = catalog.token_expires_at().await.unwrap().unwrap();
+        oauth_mock.assert_async().await;
+        config_mock.assert_async().await;
+        assert!(expires_at > before + Duration::from_secs(86_399));
+        assert!(expires_at <= std::time::Instant::now() + Duration::from_secs(86_400));
+    }
+
+    #[tokio::test]
     async fn test_oauth_with_optional_param() {
         let mut props = HashMap::new();
         props.insert("credential".to_string(), "client1:secret1".to_string());
