@@ -47,6 +47,7 @@ alone when no later patch depends on it.
 | SM-15 | `feat(transaction): add an overwrite files action` | Wasif | SM-13 and SM-14 | #3300 and #3046, both open | `transaction::overwrite_files::tests` | An upstream overwrite passes these tests |
 | SM-16 | `test: pin the fork APIs Supermetal calls` | Wasif | SM-08, SM-09, SM-10, SM-12, SM-14 and SM-15 | none | `tests/supermetal/app_api.rs` | Never, and it changes with the patches |
 | SM-17 | `chore: document and check the patch stack` | Wasif | none | none | `supermetal/check-stack.sh` | Never |
+| SM-18 | `fix(transaction): keep the bounds of position deletes in manifests` | Wasif | SM-13 and SM-14 | none | `row_delta::tests::position_deletes_keep_their_file_path_and_pos_bounds` | Fold its `snapshot.rs` change into SM-13 and its test into SM-14 at the next rebase |
 
 ## Behavior a new revision must keep
 
@@ -61,6 +62,7 @@ catches changes to upstream APIs.
 | Partition spec evolution | `snapshot::tests::test_summary_counts_deleted_entries_under_their_own_spec`, `row_delta::tests::adds_delete_files_under_their_own_partition_spec` |
 | Dropped partition source column | `snapshot::tests::test_deleted_entries_under_spec_with_dropped_source_column` |
 | Type promotion of partition values and bounds | `snapshot::tests::test_partition_values_from_before_a_type_promotion`, `snapshot::tests::test_promote_bound`, `snapshot::tests::test_removed_file_with_a_bound_outside_the_promoted_type`, `row_delta::tests::equality_delete_written_after_a_type_promotion` |
+| Position deletes scoped to one data file | `row_delta::tests::position_deletes_keep_their_file_path_and_pos_bounds` |
 | Deletion vectors sharing a Puffin file | `row_delta::tests::removes_one_deletion_vector_from_a_shared_puffin_file`, `row_delta::tests::rejects_ambiguous_path_only_removal` |
 | Encrypted tables | `row_delta::tests::rewrites_manifests_of_an_encrypted_table_encrypted` |
 | Sequence numbers of rewritten and deleted entries | `row_delta::tests::remove_delete_file_rewrites_manifest_and_preserves_sequence_numbers` |
@@ -119,8 +121,8 @@ rebase.
   apache/iceberg-rust#2330.
 - Supermetal injects its own `AuthManager` for REST basic and SigV4 authentication, because
   upstream resolves only `none` and `oauth2` from `rest.auth.type`.
-- Supermetal's DuckDB test helpers exchange Arrow data with duckdb through the C data interface,
-  so duckdb must use the stack's Arrow version. Supermetal pins duckdb to a duckdb-rs commit on
-  Arrow 59 until a duckdb 1.x release moves to it.
+- Supermetal uses the crates.io duckdb 1.x release, which builds its own Arrow version. Its
+  DuckDB test helpers hand duckdb's record batches to the stack's Arrow through the C data
+  interface, whose layout every Arrow version shares.
 
 The Supermetal branch that adopts this stack explains each migration step in its commit messages.

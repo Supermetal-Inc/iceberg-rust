@@ -1054,6 +1054,114 @@ mod tests {
         assert_eq!(deletes.len(), 1);
     }
 
+    #[tokio::test]
+    async fn position_deletes_keep_their_file_path_and_pos_bounds() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use parquet::file::properties::WriterProperties;
+
+        use crate::metadata_columns::{
+            RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
+        };
+        use crate::spec::{Datum, ManifestContentType, PartitionKey};
+        use crate::writer::base_writer::position_delete_writer::{
+            PositionDeleteFileWriterBuilder, position_delete_arrow_schema, position_delete_schema,
+        };
+        use crate::writer::file_writer::ParquetWriterBuilder;
+        use crate::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+        // One commit adds two data files of one partition and a V2 position delete of rows 2
+        // and 5 of the first, as equality mode commits its local deletes.
+        let table = make_v2_minimal_table();
+        let deleted_from = data_file("memory://test/data/a.parquet", &table);
+        let sibling = data_file("memory://test/data/b.parquet", &table);
+        let mut writer = PositionDeleteFileWriterBuilder::new(
+            RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(
+                    WriterProperties::builder().build(),
+                    position_delete_schema(),
+                ),
+                table.file_io().clone(),
+                DefaultLocationGenerator::with_data_location("memory://test/data".to_string()),
+                DefaultFileNameGenerator::new("pos".to_string(), None, DataFileFormat::Parquet),
+            ),
+        )
+        .build(Some(PartitionKey::new(
+            table.metadata().default_partition_spec().as_ref().clone(),
+            table.metadata().current_schema().clone(),
+            deleted_from.partition().clone(),
+        )))
+        .await
+        .unwrap();
+        writer
+            .write(
+                RecordBatch::try_new(position_delete_arrow_schema(), vec![
+                    Arc::new(StringArray::from(vec![
+                        deleted_from.file_path(),
+                        deleted_from.file_path(),
+                    ])),
+                    Arc::new(Int64Array::from(vec![2, 5])),
+                ])
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delete = writer.close().await.unwrap().pop().unwrap();
+        let mut commit = commit_with_fresh_state(
+            Transaction::new(&table)
+                .row_delta()
+                .add_data_files([deleted_from.clone(), sibling.clone()])
+                .add_delete_files([delete]),
+            &table,
+        )
+        .await
+        .unwrap();
+        let table = table_with_snapshot(&table, first_snapshot(commit.take_updates()));
+        let snapshot = table.metadata().current_snapshot().unwrap();
+
+        // The committed manifest keeps the bounds the writer produced.
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let mut committed = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content == ManifestContentType::Deletes {
+                let manifest = table.manifest_reader().read(manifest_file).await.unwrap();
+                committed.extend(manifest.entries().iter().cloned());
+            }
+        }
+        assert_eq!(committed.len(), 1);
+        let committed = committed[0].data_file();
+        let bounds = |field_id| {
+            (
+                committed.lower_bounds().get(&field_id),
+                committed.upper_bounds().get(&field_id),
+            )
+        };
+        let path = Datum::string(deleted_from.file_path());
+        assert_eq!(
+            bounds(RESERVED_FIELD_ID_DELETE_FILE_PATH),
+            (Some(&path), Some(&path))
+        );
+        assert_eq!(
+            bounds(RESERVED_FIELD_ID_DELETE_FILE_POS),
+            (Some(&Datum::long(2)), Some(&Datum::long(5)))
+        );
+
+        // The bounds scope the delete to its data file and leave the sibling clear.
+        let sequence = snapshot.sequence_number();
+        assert_eq!(
+            deletes_for(&table, snapshot, &deleted_from, sequence).await,
+            vec![committed.file_path().to_string()]
+        );
+        assert!(
+            deletes_for(&table, snapshot, &sibling, sequence)
+                .await
+                .is_empty()
+        );
+    }
+
     /// Paths of the delete files in `snapshot` that apply to `data_file` with data sequence
     /// number `sequence_number`, as a scan finds them.
     async fn deletes_for(

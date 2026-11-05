@@ -35,7 +35,7 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::transaction::validate::SnapshotValidator;
-use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
+use crate::{Error, ErrorKind, TableRequirement, TableUpdate, metadata_columns};
 
 /// A trait that defines how different table operations produce new snapshots.
 ///
@@ -235,21 +235,25 @@ impl<'a> RemovedFiles<'a> {
     }
 }
 
-/// Fits `file`'s column bounds to the types `schema` gives their columns, since a manifest
-/// encodes every bound with the type its schema declares. A bound of an older type is
-/// promoted along Iceberg's type promotions; one that cannot be, such as a long bound under
-/// a schema where the column is still an int, or one whose column is not in the schema, is
-/// dropped. Bounds are optional metrics, so dropping one only loses pruning.
+/// Fits `file`'s bounds to `schema`, because a manifest encodes each bound with the type its
+/// schema declares. It promotes a bound of an older type along Iceberg's type promotions and
+/// drops a bound it cannot promote, such as a long bound for a column that is still an int.
+/// It also drops a bound whose column is outside both the schema and the reserved metadata
+/// columns.
+///
+/// Position delete files bound the reserved `file_path` and `pos` columns, which no table
+/// schema holds. Readers scope a position delete to one data file through equal `file_path`
+/// bounds and apply it to its whole partition otherwise.
 fn fit_bounds_to_schema(file: &mut DataFile, schema: &Schema) {
     for bounds in [&mut file.lower_bounds, &mut file.upper_bounds] {
         *bounds = std::mem::take(bounds)
             .into_iter()
             .filter_map(|(field_id, bound)| {
-                let field_type = schema
-                    .field_by_id(field_id)?
-                    .field_type
-                    .as_primitive_type()?;
-                promote_bound(bound, field_type).map(|bound| (field_id, bound))
+                let field = schema
+                    .field_by_id(field_id)
+                    .or_else(|| metadata_columns::get_metadata_field(field_id).ok())?;
+                promote_bound(bound, field.field_type.as_primitive_type()?)
+                    .map(|bound| (field_id, bound))
             })
             .collect();
     }
